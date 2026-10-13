@@ -56,6 +56,7 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()   # Render sets t
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")      # progress + settings yahan save hote hain
 TRANSMISSIONS = int(os.environ.get("TRANSMISSIONS", "4"))        # parallel upload/download streams
 PREFETCH = max(1, int(os.environ.get("PREFETCH", "3")))          # kitni files aage se download/prepare hon
+LIVE_PANEL = env_bool("LIVE_PANEL", False)                              # True => job ke dauran live progress panel dikhao
 MAX_RETRIES = max(1, int(os.environ.get("MAX_RETRIES", "3")))    # network error pe kitni baar retry
 
 # Telegram guideline: ek chat me ~1 message/second se zyada nahi. Isliye delay 1s se kam allowed nahi.
@@ -681,13 +682,18 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
         else "🔁 <b>Failed IDs dobara try ho rahe hain</b>"
     status = await m.reply_text(
         "🚀 <b>Forwarding shuru ho gayi</b>\n"
+        f"📥 Destination: <code>{target}</code> · 📊 Total message: <code>{js.total}</code>\n"
+        "Khatam hone par aapko ek message aayega.\n"
+        "<i>/status · /pause · /stop</i>"
+        if not LIVE_PANEL else
+        "🚀 <b>Forwarding shuru ho gayi</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"{label}\n"
         f"📥 Destination: <code>{target}</code>{' (sirf files)' if media_only else ''}\n"
         f"📊 Total message: <code>{js.total}</code>\n"
         f"⚙️ Pipeline: <code>{PREFETCH}</code> files aage se prepare hongi\n\n"
         "<i>Baaki time ka andaza kuch messages ke baad dikhega.</i>",
-        parse_mode=ParseMode.HTML, reply_markup=job_buttons(False),
+        parse_mode=ParseMode.HTML, reply_markup=job_buttons(False) if LIVE_PANEL else None,
     )
     js.status = status
     pending = deque()   # (message_id, prepare-task) - order me
@@ -725,6 +731,8 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
         maybe_save()
 
     async def tick():
+        if not LIVE_PANEL:
+            return
         if time.monotonic() - js.last_edit >= 8:
             js.last_edit = time.monotonic()
             await safe_edit(status, render_panel("🚀 <b>Forwarding in progress</b>"),
@@ -751,10 +759,12 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
                 raise StopRequested
             await consume(pending.popleft())
             await tick()
-        await safe_edit(status, render_panel("✅ <b>Forwarding complete</b>"))
+        if LIVE_PANEL:
+            await safe_edit(status, render_panel("✅ <b>Forwarding complete</b>"))
     except StopRequested:
         outcome = "stopped"
-        await safe_edit(status, render_panel("⛔ <b>Forwarding roki gayi</b>", resume_hint))
+        if LIVE_PANEL:
+            await safe_edit(status, render_panel("⛔ <b>Forwarding roki gayi</b>", resume_hint))
     except Exception as e:
         outcome = "error"
         print(f"run_job crashed: {type(e).__name__}: {e}")
