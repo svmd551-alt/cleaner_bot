@@ -44,8 +44,12 @@ CLEAN_FILENAME = os.environ.get("CLEAN_FILENAME", "false").lower() == "true"  # 
 SET_POSTER = os.environ.get("SET_POSTER", "false").lower() == "true"          # video pe TMDB poster thumbnail (re-upload lagega)
 BLOCK_WORDS = [w.strip() for w in os.environ.get("BLOCK_WORDS", "").split(",") if w.strip()]  # e.g. ClipmateMovies
 PORT = int(os.environ.get("PORT", "8080"))    # Render health-check port
-# Har send ke baad ruk-ne ka time (seconds). Kam = tez, par FloodWait ka chance badhta hai (bot khud wait kar leta hai).
-SEND_DELAY = float(os.environ.get("SEND_DELAY", "0.3"))
+# Telegram guideline (core.telegram.org/bots/faq): ek chat me 1 message/second se zyada nahi bhejna chahiye
+# (lagatar zyada bhejne par 429 / FloodWait aata hai). Isliye delay 1 second se kam allowed nahi hai.
+MIN_DELAY = 1.0
+SEND_DELAY = max(float(os.environ.get("SEND_DELAY", "1.0")), MIN_DELAY)
+# Live rate-limit state: FloodWait aane par delay khud badh jata hai, phir dheere dheere wapas kam hota hai
+rate = {"delay": SEND_DELAY, "floods": 0, "flood_secs": 0.0}
 # Ek saath kitni file upload/download ho sakti hain (re-upload mode me speed badhata hai)
 TRANSMISSIONS = int(os.environ.get("TRANSMISSIONS", "4"))
 
@@ -166,7 +170,13 @@ async def safe(coro_fn, *args, **kwargs):
         try:
             return await coro_fn(*args, **kwargs)
         except FloodWait as e:
-            await asyncio.sleep(e.value + 1)
+            # Telegram ne kaha hai itni der ruko (retry_after) - utna wait, phir dobara try
+            wait = int(e.value) + 1
+            rate["floods"] += 1
+            rate["flood_secs"] += wait
+            rate["delay"] = min(rate["delay"] * 1.5, 10.0)   # aage ke liye delay badha do
+            print(f"FloodWait: Telegram ne {wait}s rukne ko kaha (delay ab {rate['delay']:.1f}s)")
+            await asyncio.sleep(wait)
 
 
 async def safe_edit(message: Message, text: str):
@@ -372,6 +382,7 @@ async def clean_cmd(client: Client, m: Message):
         return await m.reply_text("Invalid message ID range. Start ID must be >= 1 and end ID must be >= start ID.")
 
     running.update(busy=True, stop=False)
+    rate.update(delay=SEND_DELAY, floods=0, flood_secs=0.0)   # nayi job ke liye reset
     total = end_id - start_id + 1   # ID range ke hisaab se kul messages (deleted/non-file IDs bhi gine jaate hain)
     status = await m.reply_text(
         "🚀 <b>Forwarding shuru ho gayi</b>\n"
@@ -411,6 +422,8 @@ async def clean_cmd(client: Client, m: Message):
             f"❌ <b>Failed</b> <code>{failed}</code>\n\n"
             f"⚡ <b>Speed</b>    <code>{speed:.1f} files/min</code>\n"
             f"⏱ <b>Last file</b> <code>{fmt_secs(last_took)}</code>  ·  <b>Avg</b> <code>{fmt_secs(avg_file)}</code>\n"
+            f"🛡 <b>FloodWait</b> <code>{rate['floods']}</code> baar  ·  <b>Wait</b> <code>{fmt_secs(rate['flood_secs'])}</code>"
+            f"  ·  <b>Delay</b> <code>{rate['delay']:.1f}s</code>\n"
             f"🕒 <b>Elapsed</b>  <code>{fmt_secs(elapsed)}</code>  ·  <b>ETA</b> <code>{eta_txt}</code>\n"
             f"📍 <b>Current ID</b> <code>{last_id}</code> / <code>{end_id}</code>"
         )
@@ -434,7 +447,8 @@ async def clean_cmd(client: Client, m: Message):
                         sent += 1
                         last_took = time.monotonic() - t0
                         print(f"msg {msg.id} sent in {fmt_secs(last_took)}")
-                        await asyncio.sleep(SEND_DELAY)  # sirf asli send ke baad, flood se bachne ke liye
+                        await asyncio.sleep(rate["delay"])  # Telegram guideline: ~1 msg/sec per chat
+                        rate["delay"] = max(SEND_DELAY, rate["delay"] * 0.97)  # flood ke baad dheere dheere normal
                     else:
                         skipped += 1  # khaali/skip message pe koi wait nahi
                 except Exception as e:
