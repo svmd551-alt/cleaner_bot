@@ -1,8 +1,10 @@
 import os
 import re
 import asyncio
+import html
 import shutil
 import tempfile
+import time
 from io import BytesIO
 
 # Python 3.12+/3.14 me pyrogram import hote hi event loop maangta hai - pehle se bana do
@@ -142,6 +144,23 @@ class StopRequested(Exception):
     """/stop dabane par kaam rokne ke liye."""
 
 
+def fmt_secs(s: float) -> str:
+    """Seconds ko padhne layak form me: 45s, 3m 20s, 1h 05m."""
+    s = int(round(s))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+
+
+def progress_bar(pct: float, width: int = 14) -> str:
+    """Premium-style progress bar: ████████░░░░░░  57.1%"""
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(width * pct / 100))
+    return f"{'█' * filled}{'░' * (width - filled)}  {pct:.1f}%"
+
+
 async def safe(coro_fn, *args, **kwargs):
     while True:
         try:
@@ -153,7 +172,7 @@ async def safe(coro_fn, *args, **kwargs):
 async def safe_edit(message: Message, text: str):
     """Status message edit karo; fail ho to kaam na ruke."""
     try:
-        await safe(message.edit_text, text)
+        await safe(message.edit_text, text, parse_mode=ParseMode.HTML)
     except MessageNotModified:
         pass
     except Exception as e:
@@ -263,27 +282,46 @@ async def process(client: Client, msg: Message) -> bool:
 
 
 # ---------- COMMANDS ----------
-running = {"stop": False, "busy": False}
+running = {"stop": False, "busy": False, "panel": None}  # panel = live status text banane wala function
 # Fail closed: if ADMINS is empty, nobody can run history-processing commands.
 admin_filter = filters.user(ADMINS) if ADMINS else filters.user([])
 
 USAGE = (
-    "Use:\n"
-    "/sendall - source channel ki saari files\n"
-    "/sendall <start_id> - kisi id se aage ki saari files\n"
-    "/clean <start_id> <end_id> - ek range\n\n"
-    "(Saari files ke liye bot ko source channel me admin + Post Messages permission chahiye)"
+    "📖 <b>Commands</b>\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "▫️ <code>/sendall</code> — source channel ki saari files\n"
+    "▫️ <code>/sendall 500</code> — ID 500 se aage ki saari files\n"
+    "▫️ <code>/clean 100 200</code> — sirf ek range (start, end ID)\n"
+    "▫️ <code>/status</code> — chalte kaam ki live progress\n"
+    "▫️ <code>/stop</code> — kaam roko\n\n"
+    "<i>Saari files ke liye bot ko source channel me admin + Post Messages permission chahiye.</i>"
 )
 
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(_, m: Message):
     await m.reply_text(
-        "Main source channel ki files ko target channel mai forward karta hoon.\n\n"
-        "/sendall - source channel ki saari files target me bhejo\n"
-        "/clean <start_id> <end_id> - sirf ek range bhejo\n"
-        "/stop - chalte hue kaam ko roko"
+        "✨ <b>Channel Cleaner &amp; Forwarder</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Source channel ki files ko saaf karke (caption se @username aur links hata kar) "
+        "target channel me bhejta hoon.\n\n"
+        f"{USAGE}",
+        parse_mode=ParseMode.HTML,
     )
+
+
+@app.on_message(filters.command("help") & filters.private)
+async def help_cmd(_, m: Message):
+    await m.reply_text(USAGE, parse_mode=ParseMode.HTML)
+
+
+@app.on_message(filters.command("status") & filters.private & admin_filter)
+async def status_cmd(_, m: Message):
+    panel = running.get("panel")
+    if running["busy"] and panel:
+        await m.reply_text(panel("🚀 <b>Forwarding in progress</b>"), parse_mode=ParseMode.HTML)
+    else:
+        await m.reply_text("😴 Abhi koi kaam nahi chal raha.\n\n/sendall se shuru karo.")
 
 
 @app.on_message(filters.command(["clean", "sendall"]) & filters.private & admin_filter)
@@ -315,7 +353,7 @@ async def clean_cmd(client: Client, m: Message):
         else:
             start_id, end_id = int(args[0]), int(args[1])
     except (ValueError, IndexError):
-        return await m.reply_text(USAGE)
+        return await m.reply_text(USAGE, parse_mode=ParseMode.HTML)
 
     # 3) Last message id nikalo (sendall ke liye)
     if end_id is None:
@@ -334,9 +372,53 @@ async def clean_cmd(client: Client, m: Message):
         return await m.reply_text("Invalid message ID range. Start ID must be >= 1 and end ID must be >= start ID.")
 
     running.update(busy=True, stop=False)
-    status = await m.reply_text("Shuru ho gaya...")
+    total = end_id - start_id + 1   # ID range ke hisaab se kul messages (deleted/non-file IDs bhi gine jaate hain)
+    status = await m.reply_text(
+        "🚀 <b>Forwarding shuru ho gayi</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📍 Range: <code>{start_id}</code> → <code>{end_id}</code>\n"
+        f"📊 Total message: <code>{total}</code>\n\n"
+        "<i>Baaki time ka andaza kuch messages ke baad dikhega.</i>",
+        parse_mode=ParseMode.HTML,
+    )
     sent = skipped = failed = 0
     last_id = start_id - 1
+    t_start = time.monotonic()
+    last_took = 0.0       # pichli file bhejne me kitna time laga
+    last_edit = 0.0       # status message aakhri baar kab edit hua
+
+    def panel(title: str, footer: str = "") -> str:
+        """Premium status card (HTML)."""
+        elapsed = time.monotonic() - t_start
+        done = max(last_id - start_id + 1, 0)
+        left = max(total - done, 0)
+        pct = done * 100 / total if total else 100
+        avg_file = elapsed / sent if sent else 0
+        speed = sent * 60 / elapsed if elapsed > 0 and sent else 0
+        if not left:
+            eta_txt = "0s"
+        elif done:
+            eta_txt = fmt_secs(elapsed / done * left)
+        else:
+            eta_txt = "calculate ho raha hai..."
+        text = (
+            f"{title}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"<code>{progress_bar(pct)}</code>\n\n"
+            f"📊 <b>Total</b>   <code>{total}</code>\n"
+            f"✅ <b>Done</b>    <code>{done}</code>   ⏳ <b>Left</b> <code>{left}</code>\n\n"
+            f"📤 <b>Sent</b> <code>{sent}</code>  ⏭ <b>Skipped</b> <code>{skipped}</code>  "
+            f"❌ <b>Failed</b> <code>{failed}</code>\n\n"
+            f"⚡ <b>Speed</b>    <code>{speed:.1f} files/min</code>\n"
+            f"⏱ <b>Last file</b> <code>{fmt_secs(last_took)}</code>  ·  <b>Avg</b> <code>{fmt_secs(avg_file)}</code>\n"
+            f"🕒 <b>Elapsed</b>  <code>{fmt_secs(elapsed)}</code>  ·  <b>ETA</b> <code>{eta_txt}</code>\n"
+            f"📍 <b>Current ID</b> <code>{last_id}</code> / <code>{end_id}</code>"
+        )
+        if footer:
+            text += f"\n\n{footer}"
+        return text
+
+    running["panel"] = panel
 
     try:
         for chunk_start in range(start_id, end_id + 1, 100):
@@ -346,41 +428,50 @@ async def clean_cmd(client: Client, m: Message):
                 if running["stop"]:
                     raise StopRequested
                 last_id = getattr(msg, "id", last_id)
+                t0 = time.monotonic()
                 try:
                     if await process(client, msg):
                         sent += 1
+                        last_took = time.monotonic() - t0
+                        print(f"msg {msg.id} sent in {fmt_secs(last_took)}")
                         await asyncio.sleep(SEND_DELAY)  # sirf asli send ke baad, flood se bachne ke liye
                     else:
                         skipped += 1  # khaali/skip message pe koi wait nahi
                 except Exception as e:
                     failed += 1
                     print(f"msg {getattr(msg, 'id', '?')} failed: {e}")
-            await safe_edit(status, f"Chal raha hai... ID {ids[-1]}/{end_id}\n"
-                                    f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}")
-        await safe_edit(status, f"Ho gaya ✅\nSent: {sent} | Skipped: {skipped} | Failed: {failed}")
+                # status har ~10 second me update (pehle sirf 100 messages baad hota tha)
+                if time.monotonic() - last_edit >= 10:
+                    last_edit = time.monotonic()
+                    await safe_edit(status, panel("🚀 <b>Forwarding in progress</b>"))
+        await safe_edit(status, panel("✅ <b>Forwarding complete</b>"))
     except StopRequested:
         await safe_edit(
             status,
-            f"Roka gaya ⛔ (last ID: {last_id})\n"
-            f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}\n"
-            f"Aage badhane ke liye: /sendall {last_id + 1}"
+            panel("⛔ <b>Forwarding roki gayi</b>",
+                  f"▶️ Aage badhane ke liye: <code>/sendall {last_id + 1}</code>")
         )
     except Exception as e:
         print(f"clean_cmd crashed: {e}")
         await safe_edit(
             status,
-            f"Error aa gaya ❌ (last ID: {last_id})\n{type(e).__name__}: {e}\n"
-            f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}\n"
-            f"Dobara shuru: /sendall {last_id + 1}"
+            panel("❌ <b>Error aa gaya</b>",
+                  f"<code>{html.escape(type(e).__name__ + ': ' + str(e))}</code>\n"
+                  f"▶️ Dobara shuru: <code>/sendall {last_id + 1}</code>")
         )
     finally:
         running["busy"] = False
+        running["panel"] = None
 
 
 @app.on_message(filters.command("stop") & filters.private & admin_filter)
 async def stop_cmd(_, m: Message):
-    running["stop"] = True
-    await m.reply_text("Stop request bhej di.")
+    if running["busy"]:
+        running["stop"] = True
+        await m.reply_text("⛔ <b>Stop request bhej di.</b>\nCurrent file khatam hote hi kaam ruk jayega.",
+                           parse_mode=ParseMode.HTML)
+    else:
+        await m.reply_text("😴 Abhi koi kaam nahi chal raha.")
 
 
 # new posts in the source channel get cleaned and shared automatically
