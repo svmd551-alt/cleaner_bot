@@ -42,8 +42,13 @@ CLEAN_FILENAME = os.environ.get("CLEAN_FILENAME", "false").lower() == "true"  # 
 SET_POSTER = os.environ.get("SET_POSTER", "false").lower() == "true"          # video pe TMDB poster thumbnail (re-upload lagega)
 BLOCK_WORDS = [w.strip() for w in os.environ.get("BLOCK_WORDS", "").split(",") if w.strip()]  # e.g. ClipmateMovies
 PORT = int(os.environ.get("PORT", "8080"))    # Render health-check port
+# Har send ke baad ruk-ne ka time (seconds). Kam = tez, par FloodWait ka chance badhta hai (bot khud wait kar leta hai).
+SEND_DELAY = float(os.environ.get("SEND_DELAY", "0.3"))
+# Ek saath kitni file upload/download ho sakti hain (re-upload mode me speed badhata hai)
+TRANSMISSIONS = int(os.environ.get("TRANSMISSIONS", "4"))
 
-app = Client("cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+             max_concurrent_transmissions=TRANSMISSIONS)
 
 
 # ---------- CLEANING ----------
@@ -344,12 +349,12 @@ async def clean_cmd(client: Client, m: Message):
                 try:
                     if await process(client, msg):
                         sent += 1
+                        await asyncio.sleep(SEND_DELAY)  # sirf asli send ke baad, flood se bachne ke liye
                     else:
-                        skipped += 1
+                        skipped += 1  # khaali/skip message pe koi wait nahi
                 except Exception as e:
                     failed += 1
                     print(f"msg {getattr(msg, 'id', '?')} failed: {e}")
-                await asyncio.sleep(1)  # flood se bachne ke liye
             await safe_edit(status, f"Chal raha hai... ID {ids[-1]}/{end_id}\n"
                                     f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}")
         await safe_edit(status, f"Ho gaya ✅\nSent: {sent} | Skipped: {skipped} | Failed: {failed}")
