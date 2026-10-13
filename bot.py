@@ -1,4 +1,4 @@
-ximport os
+import os
 import re
 import asyncio
 import shutil
@@ -20,12 +20,19 @@ from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
 # ---------- CONFIG (environment variables) ----------
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMINS = [int(x) for x in os.environ.get("ADMINS", "").split()]   # space separated user ids
-SOURCE = int(os.environ["SOURCE_CHANNEL"])    # database channel id, e.g. -1001234567890
-TARGET = int(os.environ["TARGET_CHANNEL"])    # new channel id
+def required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+API_ID = int(required_env("API_ID"))
+API_HASH = required_env("API_HASH")
+BOT_TOKEN = required_env("BOT_TOKEN")
+ADMINS = [int(x) for x in os.environ.get("ADMINS", "").replace(",", " ").split()]
+SOURCE = int(required_env("SOURCE_CHANNEL"))  # source/database channel ID
+TARGET = int(required_env("TARGET_CHANNEL"))  # destination channel ID
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")   # free key from themoviedb.org (for posters)
 AUTO_FORWARD = os.environ.get("AUTO_FORWARD", "true").lower() == "true"
 # Default: file jaisi hai waisi forward (re-upload nahi), bas caption se @username aur telegram links hat jate hain
@@ -217,7 +224,8 @@ async def process(client: Client, msg: Message) -> bool:
 
 # ---------- COMMANDS ----------
 running = {"stop": False, "busy": False}
-admin_filter = filters.user(ADMINS) if ADMINS else filters.all
+# Fail closed: if ADMINS is empty, nobody can run history-processing commands.
+admin_filter = filters.user(ADMINS) if ADMINS else filters.user([])
 
 
 @app.on_message(filters.command("start") & filters.private)
@@ -253,9 +261,13 @@ async def clean_cmd(client: Client, m: Message):
             f"Error: {e}"
         )
 
+    if start_id < 1 or end_id < start_id:
+        return await m.reply_text("Invalid message ID range. Start ID must be >= 1 and end ID must be >= start ID.")
+
     running.update(busy=True, stop=False)
     status = await m.reply_text("Shuru ho gaya...")
     sent = skipped = failed = 0
+    last_id = start_id - 1
 
     try:
         for chunk_start in range(start_id, end_id + 1, 100):
@@ -264,6 +276,7 @@ async def clean_cmd(client: Client, m: Message):
             for msg in msgs:
                 if running["stop"]:
                     raise asyncio.CancelledError
+                last_id = getattr(msg, "id", last_id)
                 try:
                     if await process(client, msg):
                         sent += 1
@@ -277,7 +290,11 @@ async def clean_cmd(client: Client, m: Message):
                                    f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}")
         await status.edit_text(f"Ho gaya ✅\nSent: {sent} | Skipped: {skipped} | Failed: {failed}")
     except asyncio.CancelledError:
-        await status.edit_text(f"Roka gaya ⛔ (last ID: {msg.id})\nSent: {sent} | Skipped: {skipped} | Failed: {failed}\nAage badhane ke liye: /sendall {msg.id}")
+        await status.edit_text(
+            f"Roka gaya ⛔ (last ID: {last_id})\n"
+            f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}\n"
+            f"Aage badhane ke liye: /sendall {last_id + 1}"
+        )
     finally:
         running["busy"] = False
 
@@ -290,7 +307,7 @@ async def stop_cmd(_, m: Message):
 
 # new posts in the source channel get cleaned and shared automatically
 if AUTO_FORWARD:
-    @app.on_message(filters.chat(SOURCE) & (filters.document | filters.video | filters.audio))
+    @app.on_message(filters.chat(SOURCE) & (filters.document | filters.video | filters.audio | filters.photo))
     async def auto(client: Client, m: Message):
         try:
             await process(client, m)
