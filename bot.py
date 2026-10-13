@@ -48,7 +48,8 @@ API_HASH = required_env("API_HASH")
 BOT_TOKEN = required_env("BOT_TOKEN")
 ADMINS = [int(x) for x in os.environ.get("ADMINS", "").replace(",", " ").split()]
 SOURCE = int(required_env("SOURCE_CHANNEL"))   # source/database channel ID
-TARGET = int(required_env("TARGET_CHANNEL"))   # destination channel ID
+TARGET = int(required_env("TARGET_CHANNEL"))   # normal destination channel ID
+QUALITY_TARGET = int(os.environ["QUALITY_TARGET_CHANNEL"].strip()) if os.environ.get("QUALITY_TARGET_CHANNEL", "").strip() else None  # CAM/TS/TC etc. destination
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")           # free key from themoviedb.org (posters)
 BLOCK_WORDS = [w.strip() for w in os.environ.get("BLOCK_WORDS", "").split(",") if w.strip()]
 PORT = int(os.environ.get("PORT", "8080"))                   # Render health-check port
@@ -75,6 +76,7 @@ cfg = {
     "dedupe": env_bool("DEDUPE", True),                  # pehle bheji hui file dobara na bhejo
     "auto": env_bool("AUTO_FORWARD", True),              # source me nayi post aate hi auto forward
     "notify": env_bool("NOTIFY", True),                  # kaam khatam hone par alag message (ping)
+    "delete_quality": env_bool("DELETE_QUALITY", False), # CAM/HDTS/HDTC file quality channel me jaane ke baad source se delete
 }
 SETTING_LABELS = {
     "clean_caption": "🧹 Clean caption",
@@ -83,6 +85,7 @@ SETTING_LABELS = {
     "dedupe": "♻️ Skip duplicates",
     "auto": "📡 Auto-forward new posts",
     "notify": "🔔 Notify on finish",
+    "delete_quality": "🗑 Delete quality files from source",
 }
 
 app = Client("cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
@@ -163,7 +166,51 @@ def maybe_save(force: bool = False):
 LINK_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/\S+|tg://\S+", re.I)
 WWW_RE = re.compile(r"\bwww\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b", re.I)
 USER_RE = re.compile(r"@[A-Za-z0-9_]+")
+# Remove low-quality/cinema-recording tags from both captions and filenames.
+# Supports CAMRip, CAM-Rip, CAM.Rip and tags inside []/()/{}.
+QUALITY_CORE = (r"(?<![A-Za-z0-9])(?:CAM[ \t]*[-_.]?[ \t]*RIP|HDCAM|CAM|TELESYNC|HDTS|TELECINE|HDTC|TS|TC)"
+                r"(?![A-Za-z0-9])")
+QUALITY_RE = re.compile(QUALITY_CORE, re.I)
+# tag + uske aas-paas ka ek separator hi hatao (baaki caption ka spacing/punctuation na chhede)
+QUALITY_START_RE = re.compile(r"(?m)^[ \t]*" + QUALITY_CORE + r"[ \t]*[._-]?[ \t]*", re.I)
+QUALITY_STRIP_RE = re.compile(r"[ \t]*[._-]?[ \t]*" + QUALITY_CORE, re.I)
 block_re = None
+
+
+def clean_quality_tags(text: str) -> str:
+    if not text or not QUALITY_RE.search(text):
+        return text                      # tag nahi => text bilkul waisa hi (comma/dash spacing safe)
+    text = QUALITY_START_RE.sub("", text)
+    text = QUALITY_STRIP_RE.sub("", text)
+    text = re.sub(r"[\[({][ \t]*[\])}]", "", text)          # khaali [] () {}
+    text = re.sub(r"([\[({])[ \t]+", r"\1", text)           # "[ 720p]" -> "[720p]"
+    text = re.sub(r"[ \t]+([\])}])", r"\1", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text
+
+
+HDTS_HDTC_RE = re.compile(r"(?<![A-Za-z0-9])HD[ \t]*[-_.]?[ \t]*(?:TS|TC)(?![A-Za-z0-9])", re.I)
+HDRIP_RE = re.compile(r"(?<![A-Za-z0-9])HD[ \t]*[-_.]?[ \t]*RIP(?![A-Za-z0-9])", re.I)
+
+
+def has_quality_tag(msg: Message) -> bool:
+    """True when filename or caption has a CAM/TS/TC-type tag. HDRip files are always normal."""
+    media = msg.document or msg.video or msg.audio or msg.animation
+    filename = getattr(media, "file_name", "") if media else ""
+    caption = msg.caption or msg.text or ""
+    combined = f"{filename} {caption}"
+    if HDTS_HDTC_RE.search(combined):
+        return True                      # HDTS / HDTC => hamesha quality channel
+    if HDRIP_RE.search(combined):
+        return False                     # HDRip => hamesha normal channel
+    return bool(QUALITY_RE.search(combined))
+
+
+def destination_for(msg: Message, fallback: int) -> tuple[int, bool]:
+    """Return (destination, should_delete_source_after_success). Delete sirf /settings me ON ho tab."""
+    if QUALITY_TARGET is not None and has_quality_tag(msg):
+        return QUALITY_TARGET, bool(cfg["delete_quality"])
+    return fallback, False
 
 
 def rebuild_block_re():
@@ -173,6 +220,7 @@ def rebuild_block_re():
 
 
 def clean_text(text: str) -> str:
+    text = clean_quality_tags(text)
     text = LINK_RE.sub("", text)
     text = WWW_RE.sub("", text)
     if block_re:
@@ -184,6 +232,7 @@ def clean_text(text: str) -> str:
 
 def clean_filename(name: str) -> str:
     base, ext = os.path.splitext(name)
+    base = clean_quality_tags(base)
     base = LINK_RE.sub("", base)
     base = WWW_RE.sub("", base)
     if block_re:
@@ -443,6 +492,12 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
     if dedupe and key and key in seen:
         return Job(kind="dup")
 
+    # Quality channel (CAM/TS/TC): file, naam aur caption bilkul original rehte hain (no clean, no footer, no poster)
+    if QUALITY_TARGET is not None and target == QUALITY_TARGET:
+        if msg.text:
+            return Job(kind="text", text=msg.text[:4096])
+        return Job(kind="copy", msg_id=msg.id, caption=None, key=key)
+
     if msg.text:
         t = (clean_text(msg.text) if cfg["clean_caption"] else msg.text)[:4096]
         return Job(kind="text", text=t) if t else Job(kind="skip")
@@ -701,10 +756,17 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
     pending = deque()   # (message_id, prepare-task) - order me
 
     async def consume(item):
-        mid, task = item
+        mid, task, item_target, delete_source = item
         t0 = time.monotonic()
         try:
-            res = await handle(client, task, target)
+            res = await handle(client, task, item_target)
+            # Source se tabhi delete karo jab destination par sending confirm ho chuki ho.
+            if res == "sent" and delete_source:
+                try:
+                    await safe(client.delete_messages, SOURCE, mid)
+                    print(f"msg {mid}: quality-tagged file sent to {item_target}; source deleted")
+                except Exception as de:     # file ja chuki hai - delete fail hone par 'failed' mat gino
+                    print(f"msg {mid}: sent but source delete failed: {type(de).__name__}: {de}")
         except Exception as e:
             res = "failed"
             print(f"msg {mid} failed: {type(e).__name__}: {e}")
@@ -751,7 +813,9 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
                 await gate.wait()                       # pause
                 if running["stop"]:
                     raise StopRequested
-                pending.append((mid, asyncio.create_task(prepare(client, msg, target, dedupe, media_only))))
+                item_target, delete_source = destination_for(msg, target)
+                pending.append((mid, asyncio.create_task(prepare(client, msg, item_target, dedupe, media_only)),
+                                item_target, delete_source))
                 while len(pending) >= PREFETCH:         # window bhar gayi => sabse purani bhejo
                     await consume(pending.popleft())
                     await tick()
@@ -774,9 +838,9 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
             "❌ <b>Error aa gaya</b>",
             f"<code>{html.escape(type(e).__name__ + ': ' + str(e))}</code>\n{resume_hint}"))
     finally:
-        for _, t in pending:
-            t.cancel()
-        leftovers = await asyncio.gather(*(t for _, t in pending), return_exceptions=True)
+        for item in pending:
+            item[1].cancel()
+        leftovers = await asyncio.gather(*(item[1] for item in pending), return_exceptions=True)
         for r in leftovers:
             if isinstance(r, SimpleNamespace):
                 cleanup(r)
@@ -828,6 +892,7 @@ USAGE = (
     "▫️ <code>/sendall 500</code> — ID 500 se aage ki saari files\n"
     "▫️ <code>/sendall -1001234567890</code> — saari files <b>dusre folder/channel</b> me\n"
     "▫️ <code>/sendall @channelname</code> — public channel ko username/link se bhi de sakte ho\n"
+    "▫️ <code>QUALITY_TARGET_CHANNEL</code> — CAM/TS/TC-tagged files ka separate channel (/settings me <b>Delete quality files</b> ON ho to successful send ke baad source se delete; HDRip normal channel me jata hai)\n"
     "▫️ <code>/sendall -1001234567890 files</code> — sirf files (text messages skip)\n"
     "▫️ <code>/sendall 500 -1001234567890 force</code> — ID 500 se, us channel me, duplicate check ke bina\n"
     "▫️ <code>/clean 100 200 [channel_id] [force]</code> — sirf ek range (start, end ID)\n"
@@ -1145,7 +1210,11 @@ async def auto(client: Client, m: Message):
     if not cfg["auto"]:
         return
     try:
-        res = await handle(client, prepare(client, m))
+        target, delete_source = destination_for(m, default_target())
+        res = await handle(client, prepare(client, m, target), target)
+        if res == "sent" and delete_source:
+            await safe(client.delete_messages, SOURCE, m.id)
+            print(f"auto msg {m.id}: quality-tagged file sent to {target}; source deleted")
         bump(res)
         maybe_save()
     except Exception as e:
