@@ -1,9 +1,15 @@
-import os
+ximport os
 import re
 import asyncio
 import shutil
 import tempfile
 from io import BytesIO
+
+# Python 3.12+/3.14 me pyrogram import hote hi event loop maangta hai - pehle se bana do
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 import aiohttp
 from aiohttp import web
