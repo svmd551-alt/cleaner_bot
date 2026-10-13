@@ -63,6 +63,8 @@ MAX_RETRIES = max(1, int(os.environ.get("MAX_RETRIES", "3")))    # network error
 MIN_DELAY = 1.0
 SEND_DELAY = max(float(os.environ.get("SEND_DELAY", "1.0")), MIN_DELAY)
 # Live rate-limit state: FloodWait aane par delay khud badhta hai, phir dheere dheere wapas kam hota hai
+# FloodWait ke baad delay max itna hi badhega (Telegram ~20 msg/min => ~3s/msg safe hai). Pehle 10s tak jata tha => bahut slow.
+FLOOD_MAX_DELAY = max(float(os.environ.get("FLOOD_MAX_DELAY", "3.0")), SEND_DELAY)
 rate = {"delay": SEND_DELAY, "floods": 0, "flood_secs": 0.0}
 
 # Runtime settings (/settings se on/off). Env sirf starting default hai.
@@ -332,7 +334,7 @@ async def safe(coro_fn, *args, **kwargs):
             wait = int(e.value) + 1
             rate["floods"] += 1
             rate["flood_secs"] += wait
-            rate["delay"] = min(rate["delay"] * 1.5, 10.0)
+            rate["delay"] = min(max(rate["delay"] * 1.5, 2.0), FLOOD_MAX_DELAY)
             print(f"FloodWait: Telegram ne {wait}s rukne ko kaha (delay ab {rate['delay']:.1f}s)")
             await asyncio.sleep(wait)
         except TRANSIENT as e:
@@ -364,7 +366,7 @@ async def throttle():
         if wait > 0:
             await asyncio.sleep(wait)
         last_send[0] = time.monotonic()
-        rate["delay"] = max(SEND_DELAY, rate["delay"] * 0.97)   # flood ke baad dheere normal
+        rate["delay"] = max(SEND_DELAY, rate["delay"] * 0.95)   # flood ke baad jaldi normal
 
 
 async def resolve_channels(target: int = None) -> dict:
@@ -797,6 +799,8 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
                        f"📤 Sent <code>{js.sent}</code> · ♻️ Dup <code>{js.dup}</code> · "
                        f"⏭ Skip <code>{js.skipped}</code> · ❌ Failed <code>{js.failed}</code>\n"
                        f"🕒 <code>{fmt_secs(time.monotonic() - js.t_start - js.paused_total)}</code>"
+                       + (f" · 🛡 FloodWait <code>{rate['floods']}</code> baar ({fmt_secs(rate['flood_secs'])})"
+                          if rate["floods"] else "")
                        + ("\n\n🔁 Failed files ke liye: <code>/retryfailed</code>" if js.failed_ids else ""),
                        parse_mode=ParseMode.HTML)
             if js.failed_ids:
