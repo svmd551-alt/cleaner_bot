@@ -20,19 +20,12 @@ from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
 # ---------- CONFIG (environment variables) ----------
-def required_env(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
-
-
-API_ID = int(required_env("API_ID"))
-API_HASH = required_env("API_HASH")
-BOT_TOKEN = required_env("BOT_TOKEN")
-ADMINS = [int(x) for x in os.environ.get("ADMINS", "").replace(",", " ").split()]
-SOURCE = int(required_env("SOURCE_CHANNEL"))  # source/database channel ID
-TARGET = int(required_env("TARGET_CHANNEL"))  # destination channel ID
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMINS = [int(x) for x in os.environ.get("ADMINS", "").split()]   # space separated user ids
+SOURCE = int(os.environ["SOURCE_CHANNEL"])    # database channel id, e.g. -1001234567890
+TARGET = int(os.environ["TARGET_CHANNEL"])    # new channel id
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")   # free key from themoviedb.org (for posters)
 AUTO_FORWARD = os.environ.get("AUTO_FORWARD", "true").lower() == "true"
 # Default: file jaisi hai waisi forward (re-upload nahi), bas caption se @username aur telegram links hat jate hain
@@ -41,9 +34,6 @@ CLEAN_FILENAME = os.environ.get("CLEAN_FILENAME", "false").lower() == "true"  # 
 SET_POSTER = os.environ.get("SET_POSTER", "false").lower() == "true"          # video pe TMDB poster thumbnail (re-upload lagega)
 BLOCK_WORDS = [w.strip() for w in os.environ.get("BLOCK_WORDS", "").split(",") if w.strip()]  # e.g. ClipmateMovies
 PORT = int(os.environ.get("PORT", "8080"))    # Render health-check port
-# Fast mode: bounded parallel processing. Set MAX_CONCURRENT=1 for strict message order.
-MAX_CONCURRENT = max(1, min(5, int(os.environ.get("MAX_CONCURRENT", "3"))))
-PROGRESS_EVERY = max(1, int(os.environ.get("PROGRESS_EVERY", "20")))
 
 app = Client("cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -54,16 +44,11 @@ BLOCK_RE = re.compile("@?(?:" + "|".join(map(re.escape, BLOCK_WORDS)) + ")", re.
 
 
 def clean_text(text: str) -> str:
-    """Remove Telegram links, @usernames (including [@username]), and configured blocked words."""
     text = LINK_RE.sub("", text)
     if BLOCK_RE:
         text = BLOCK_RE.sub("", text)
     text = USER_RE.sub("", text)
-    # Remove empty wrappers left behind by names such as [@ClipmateMovies], (@username), etc.
-    text = re.sub(r"[\[\(\{]\s*[\]\)\}]", "", text)
-    # Tidy whitespace left after removing usernames/links.
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    lines = [line.strip() for line in text.splitlines()]
+    lines = [re.sub(r"[ \t]{2,}", " ", l).strip() for l in text.splitlines()]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
@@ -164,12 +149,10 @@ async def process(client: Client, msg: Message) -> bool:
                 return False
             await safe(client.send_message, TARGET, t, parse_mode=ParseMode.DISABLED)
         elif CLEAN_CAPTION:
-            # Always copy media, even if cleaning removes the entire caption (e.g. only @username).
-            # Empty caption must not cause the media message to be skipped.
-            # reply_markup=None avoids copying original buttons/links.
-            cleaned_caption = clean_text(msg.caption or "")
+            # plain-text caption => caption ke andar chhupe hue (hyperlink) t.me links bhi hat jate hain,
+            # reply_markup=None => original ke buttons (jinme telegram link ho sakte hain) copy nahi hote
             await safe(client.copy_message, TARGET, SOURCE, msg.id,
-                       caption=cleaned_caption,
+                       caption=clean_text(msg.caption or ""),
                        parse_mode=ParseMode.DISABLED, reply_markup=None)
         else:
             await safe(client.copy_message, TARGET, SOURCE, msg.id)
@@ -234,8 +217,7 @@ async def process(client: Client, msg: Message) -> bool:
 
 # ---------- COMMANDS ----------
 running = {"stop": False, "busy": False}
-# Fail closed: if ADMINS is empty, nobody can run history-processing commands.
-admin_filter = filters.user(ADMINS) if ADMINS else filters.user([])
+admin_filter = filters.user(ADMINS) if ADMINS else filters.all
 
 
 @app.on_message(filters.command("start") & filters.private)
@@ -255,12 +237,19 @@ async def clean_cmd(client: Client, m: Message):
     args = m.command[1:]
     try:
         if m.command[0] == "sendall" or (args and args[0].lower() == "all"):
-            # saari files: bot channel me ek temp message bhej kar last message id nikalta hai, fir delete kar deta hai
+            # Find the latest source message without posting a temporary message.
+            # This avoids requiring "Post Messages" permission in the source channel.
             nums = [a for a in args if a.isdigit()]
             start_id = int(nums[0]) if nums else 1
-            probe = await safe(client.send_message, SOURCE, ".")
-            end_id = probe.id - 1
-            await safe(client.delete_messages, SOURCE, probe.id)
+            end_id = 0
+            async for latest_msg in client.get_chat_history(SOURCE, limit=1):
+                end_id = latest_msg.id
+                break
+            if end_id == 0:
+                return await m.reply_text(
+                    "Source channel ki history nahi mil rahi. SOURCE_CHANNEL ID check karo "
+                    "aur bot ko source channel mein add/admin karo."
+                )
         else:
             start_id, end_id = int(args[0]), int(args[1])
     except Exception as e:
@@ -271,74 +260,31 @@ async def clean_cmd(client: Client, m: Message):
             f"Error: {e}"
         )
 
-    if start_id < 1 or end_id < start_id:
-        return await m.reply_text("Invalid message ID range. Start ID must be >= 1 and end ID must be >= start ID.")
-
     running.update(busy=True, stop=False)
     status = await m.reply_text("Shuru ho gaya...")
-    sent = skipped = failed = completed = 0
-    last_id = start_id - 1
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
-    async def process_one(msg: Message):
-        if running["stop"]:
-            return (getattr(msg, "id", 0), "stopped")
-        async with semaphore:
-            if running["stop"]:
-                return (getattr(msg, "id", 0), "stopped")
-            try:
-                result = await process(client, msg)
-                return (getattr(msg, "id", 0), "sent" if result else "skipped")
-            except Exception as e:
-                print(f"msg {getattr(msg, 'id', '?')} failed: {e}")
-                return (getattr(msg, "id", 0), "failed")
+    sent = skipped = failed = 0
 
     try:
         for chunk_start in range(start_id, end_id + 1, 100):
-            if running["stop"]:
-                raise asyncio.CancelledError
             ids = list(range(chunk_start, min(chunk_start + 100, end_id + 1)))
             msgs = await safe(client.get_messages, SOURCE, ids)
-            # Bounded concurrency improves throughput without creating an unlimited task burst.
-            tasks = [asyncio.create_task(process_one(msg)) for msg in msgs if msg and not msg.empty]
-            for task in asyncio.as_completed(tasks):
-                msg_id, outcome = await task
-                if outcome == "stopped":
-                    continue
-                last_id = max(last_id, msg_id)
-                completed += 1
-                if outcome == "sent":
-                    sent += 1
-                elif outcome == "skipped":
-                    skipped += 1
-                else:
+            for msg in msgs:
+                if running["stop"]:
+                    raise asyncio.CancelledError
+                try:
+                    if await process(client, msg):
+                        sent += 1
+                    else:
+                        skipped += 1
+                except Exception as e:
                     failed += 1
-                if completed % PROGRESS_EVERY == 0:
-                    try:
-                        await status.edit_text(
-                            f"Fast Mode ⚡\nProcessed: {completed}\n"
-                            f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}\n"
-                            f"Current batch: {ids[0]}–{ids[-1]} / {end_id}"
-                        )
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value + 1)
-            if running["stop"]:
-                raise asyncio.CancelledError
-            try:
-                await status.edit_text(
-                    f"Fast Mode ⚡\nProcessed: {completed}\n"
-                    f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}\n"
-                    f"ID: {ids[-1]}/{end_id}"
-                )
-            except FloodWait as e:
-                await asyncio.sleep(e.value + 1)
-        await status.edit_text(f"Ho gaya ✅ Fast Mode\nSent: {sent} | Skipped: {skipped} | Failed: {failed}")
+                    print(f"msg {msg.id} failed: {e}")
+                await asyncio.sleep(1)  # flood se bachne ke liye
+            await status.edit_text(f"Chal raha hai... ID {ids[-1]}/{end_id}\n"
+                                   f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}")
+        await status.edit_text(f"Ho gaya ✅\nSent: {sent} | Skipped: {skipped} | Failed: {failed}")
     except asyncio.CancelledError:
-        await status.edit_text(
-            f"Roka gaya ⛔ (last ID: {last_id})\n"
-            f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}\n"
-            f"Safe resume (current batch se): /sendall {chunk_start}"
-        )
+        await status.edit_text(f"Roka gaya ⛔ (last ID: {msg.id})\nSent: {sent} | Skipped: {skipped} | Failed: {failed}\nAage badhane ke liye: /sendall {msg.id}")
     finally:
         running["busy"] = False
 
@@ -351,7 +297,7 @@ async def stop_cmd(_, m: Message):
 
 # new posts in the source channel get cleaned and shared automatically
 if AUTO_FORWARD:
-    @app.on_message(filters.chat(SOURCE) & (filters.document | filters.video | filters.audio | filters.photo))
+    @app.on_message(filters.chat(SOURCE) & (filters.document | filters.video | filters.audio))
     async def auto(client: Client, m: Message):
         try:
             await process(client, m)
