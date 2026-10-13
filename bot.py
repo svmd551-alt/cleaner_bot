@@ -77,6 +77,7 @@ cfg = {
     "auto": env_bool("AUTO_FORWARD", True),              # source me nayi post aate hi auto forward
     "notify": env_bool("NOTIFY", True),                  # kaam khatam hone par alag message (ping)
     "delete_quality": env_bool("DELETE_QUALITY", False), # CAM/HDTS/HDTC file quality channel me jaane ke baad source se delete
+    "auto_caption": env_bool("AUTO_CAPTION", True),      # caption khaali ho to TMDB se khud likho (TMDB_API_KEY chahiye)
 }
 SETTING_LABELS = {
     "clean_caption": "🧹 Clean caption",
@@ -86,6 +87,7 @@ SETTING_LABELS = {
     "auto": "📡 Auto-forward new posts",
     "notify": "🔔 Notify on finish",
     "delete_quality": "🗑 Delete quality files from source",
+    "auto_caption": "📝 Auto caption (jahan caption nahi)",
 }
 
 app = Client("cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
@@ -271,6 +273,16 @@ JUNK_RE = re.compile(
 )
 SERIES_RE = re.compile(r"\bs\d{1,2}\s?e\d{1,3}\b|\bseason\b", re.I)
 poster_cache: dict = {}   # (title, year) -> jpeg bytes | None (match nahi mila)
+info_cache: dict = {}     # (title, year) -> dict(title, year, rating, genres, overview, lang) | None
+
+GENRES = {28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime", 99: "Documentary",
+          18: "Drama", 10751: "Family", 14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
+          9648: "Mystery", 10749: "Romance", 878: "Sci-Fi", 10770: "TV Movie", 53: "Thriller",
+          10752: "War", 37: "Western", 10759: "Action & Adventure", 10762: "Kids", 10763: "News",
+          10764: "Reality", 10765: "Sci-Fi & Fantasy", 10766: "Soap", 10767: "Talk", 10768: "War & Politics"}
+QUALITY_INFO_RE = re.compile(r"\b(480p|576p|720p|1080p|2160p|4k|hdrip|webrip|web-dl|webdl|bluray|brrip|bdrip|"
+                             r"dvdrip|hdtv|x264|x265|hevc|10bit|esubs?|dual audio|hindi|english|tamil|telugu|"
+                             r"malayalam|kannada|punjabi|bengali)\b", re.I)
 
 
 def guess_title(filename: str):
@@ -313,6 +325,16 @@ async def tmdb_poster_bytes(title: str, year, filename: str):
                     if score > best_score:
                         best, best_score = res, score
                 if best and best_score >= 0.5:    # galat poster se behtar hai koi poster na ho
+                    date = best.get("release_date") or best.get("first_air_date") or ""
+                    info_cache[(title.lower(), year)] = dict(
+                        title=best.get("title") or best.get("name") or title,
+                        year=date[:4] or year or "",
+                        rating=best.get("vote_average") or 0,
+                        genres=[GENRES[g] for g in best.get("genre_ids", []) if g in GENRES][:3],
+                        overview=(best.get("overview") or "").strip(),
+                        lang=(best.get("original_language") or "").upper(),
+                        tv=(kind == "tv"),
+                    )
                     async with s.get(f"https://image.tmdb.org/t/p/w342{best['poster_path']}") as img:
                         raw = await img.read()
                     im = Image.open(BytesIO(raw)).convert("RGB")
@@ -345,6 +367,54 @@ async def fetch_poster(filename: str, dest: str) -> bool:
     except Exception as e:
         print(f"poster fetch failed for '{title}': {e}")
         return False
+
+
+async def auto_caption(msg: Message) -> str:
+    """Caption khaali ho to TMDB se title/saal/rating/genre/story likho. Match na mile to '' (caption khaali hi rahega)."""
+    if not (cfg["auto_caption"] and TMDB_API_KEY):
+        return ""
+    media = msg.document or msg.video or msg.audio
+    fname = getattr(media, "file_name", "") if media else ""
+    if not fname:
+        return ""
+    title, year = guess_title(fname)
+    if len(title) < 2:
+        return ""
+    key = (title.lower(), year)
+    try:
+        if key not in poster_cache:
+            data = await tmdb_poster_bytes(title, year, fname)
+            if len(poster_cache) > 500:
+                poster_cache.pop(next(iter(poster_cache)))
+            poster_cache[key] = data
+    except Exception as e:
+        print(f"auto caption lookup failed for '{title}': {e}")
+        return ""
+    info = info_cache.get(key)
+    if not info:
+        return ""
+    head = f"🎬 {info['title']}" + (f" ({info['year']})" if info["year"] else "")
+    lines = [head]
+    meta = []
+    if info["rating"]:
+        meta.append(f"⭐ {info['rating']:.1f}/10")
+    if info["genres"]:
+        meta.append("🎭 " + ", ".join(info["genres"]))
+    if info["lang"]:
+        meta.append(f"🌐 {info['lang']}")
+    if meta:
+        lines.append(" · ".join(meta))
+    quality = []
+    for q in QUALITY_INFO_RE.findall(fname):
+        if q.lower() not in [x.lower() for x in quality]:
+            quality.append(q)
+    if quality:
+        lines.append("📀 " + " | ".join(quality))
+    if info["overview"]:
+        story = info["overview"]
+        lines.append("")
+        lines.append("📖 " + (story[:380].rsplit(" ", 1)[0] + "..." if len(story) > 380 else story))
+    return "\n".join(lines)
 
 
 # ======================================================================
@@ -471,11 +541,19 @@ def make_progress(label: str, name: str):
     return cb
 
 
-def copy_job(msg: Message, key) -> SimpleNamespace:
+def with_footer(text: str, limit: int = 1024) -> str:
+    if state["footer"]:
+        text = f"{text}\n\n{state['footer']}" if text else state["footer"]
+    return text[:limit]
+
+
+def copy_job(msg: Message, key, generated: str = "") -> SimpleNamespace:
     """File re-upload ke bina: Telegram server-side copy (fast). Sirf caption badalta hai."""
     captionable = bool(msg.photo or msg.document or msg.video or msg.audio or msg.animation or msg.voice)
     caption = None
-    if captionable and (cfg["clean_caption"] or state["footer"]):
+    if captionable and generated:
+        caption = with_footer(generated)          # khud likha caption (original me caption tha hi nahi)
+    elif captionable and (cfg["clean_caption"] or state["footer"]):
         caption = build_caption(msg.caption or "")
     return Job(kind="copy", msg_id=msg.id, caption=caption, key=key)
 
@@ -507,8 +585,13 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
     wants_poster = cfg["set_poster"] and is_video and bool(TMDB_API_KEY)
     wants_rename = cfg["clean_filename"] and bool(media)
 
+    # caption bilkul nahi hai => TMDB se khud likho
+    generated = ""
+    if media and not (msg.caption or "").strip():
+        generated = await auto_caption(msg)
+
     if not media or not (wants_rename or wants_poster):
-        return copy_job(msg, key)
+        return copy_job(msg, key, generated)
 
     old = media.file_name
     new = clean_filename(old) if (cfg["clean_filename"] and old) else old
@@ -524,7 +607,7 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
         # naam pehle se saaf hai aur naya poster nahi => re-upload ki zarurat nahi
         if new == old and not has_poster:
             shutil.rmtree(tmp, ignore_errors=True)
-            return copy_job(msg, key)
+            return copy_job(msg, key, generated)
 
         dl_name = os.path.join(tmp, local_name(new)) if new else tmp + os.sep
         path = await safe(client.download_media, msg, file_name=dl_name,
@@ -543,7 +626,8 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
                                    file_name=os.path.join(tmp, "thumb.jpg"))
 
         job = Job(kind="upload", path=path, thumb=thumb, name=new, tmp=tmp, key=key,
-                  caption=build_caption(msg.caption or "") if (cfg["clean_caption"] or state["footer"])
+                  caption=with_footer(generated) if generated
+                  else build_caption(msg.caption or "") if (cfg["clean_caption"] or state["footer"])
                   else (msg.caption or ""))
         if msg.video:
             job.send_as = "video"
