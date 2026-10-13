@@ -94,12 +94,25 @@ state = {
     "blocks": [],        # /addblock se jude words
     "failed": [],        # fail hui message IDs (/retryfailed)
     "footer": "",        # har caption ke neeche jaane wala text
+    "target": None,      # /setdest se chuna default destination (None => env TARGET_CHANNEL)
     "cfg": {},
     "last_job": None,    # {"start","end","last_id","done"} - /resume ke liye
     "totals": {"sent": 0, "dup": 0, "failed": 0},
 }
 seen: set = set()        # file_unique_id of already-sent files
 dirty = [0]
+
+
+def default_target() -> int:
+    """Default destination: /setdest se set kiya hua, warna env TARGET_CHANNEL."""
+    return state.get("target") or TARGET
+
+
+def seen_key(key, target: int):
+    """Duplicate check har destination ke liye alag (env TARGET ke keys pehle jaise hi rehte hain)."""
+    if not key:
+        return None
+    return key if target == TARGET else f"{target}:{key}"
 
 
 def load_state():
@@ -111,7 +124,7 @@ def load_state():
     except Exception as e:
         print(f"state load failed: {e}")
         return
-    for k in ("blocks", "failed", "footer", "last_job"):
+    for k in ("blocks", "failed", "footer", "last_job", "target"):
         if k in data:
             state[k] = data[k]
     state["totals"].update(data.get("totals", {}))
@@ -353,10 +366,10 @@ async def throttle():
         rate["delay"] = max(SEND_DELAY, rate["delay"] * 0.97)   # flood ke baad dheere normal
 
 
-async def resolve_channels() -> dict:
-    """SOURCE aur TARGET ko resolve karo taaki Pyrogram peer cache me save kar le."""
+async def resolve_channels(target: int = None) -> dict:
+    """SOURCE aur destination ko resolve karo taaki Pyrogram peer cache me save kar le."""
     results = {}
-    for name, cid in (("SOURCE", SOURCE), ("TARGET", TARGET)):
+    for name, cid in (("SOURCE", SOURCE), ("TARGET", target or default_target())):
         try:
             chat = await safe(app.get_chat, cid)
             print(f"{name} OK: {chat.title} ({chat.id})")
@@ -415,11 +428,16 @@ def copy_job(msg: Message, key) -> SimpleNamespace:
     return Job(kind="copy", msg_id=msg.id, caption=caption, key=key)
 
 
-async def prepare(client: Client, msg: Message) -> SimpleNamespace:
+async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool = None,
+                  media_only: bool = False) -> SimpleNamespace:
     if msg.empty or msg.service:
         return Job(kind="skip")
-    key = file_key(msg)
-    if cfg["dedupe"] and key and key in seen:
+    if media_only and not file_key(msg):     # 'files' mode: text/poll/etc. skip, sirf file wale messages
+        return Job(kind="skip")
+    target = target or default_target()
+    dedupe = cfg["dedupe"] if dedupe is None else dedupe
+    key = seen_key(file_key(msg), target)
+    if dedupe and key and key in seen:
         return Job(kind="dup")
 
     if msg.text:
@@ -493,36 +511,36 @@ def mark_seen(key):
         dirty[0] += 1
 
 
-async def deliver(client: Client, job) -> str:
+async def deliver(client: Client, job, target: int) -> str:
     k = job.kind
     if k in ("skip", "dup"):
         return k
     await throttle()
     if k == "text":
-        await safe(client.send_message, TARGET, job.text, parse_mode=ParseMode.DISABLED)
+        await safe(client.send_message, target, job.text, parse_mode=ParseMode.DISABLED)
     elif k == "copy":
         extra = {}
         if job.caption is not None:
             # reply_markup=None => original ke buttons (jinme telegram link ho sakte hain) copy nahi hote
             extra = dict(caption=job.caption, parse_mode=ParseMode.DISABLED, reply_markup=None)
-        await safe(client.copy_message, TARGET, SOURCE, job.msg_id, **extra)
+        await safe(client.copy_message, target, SOURCE, job.msg_id, **extra)
     elif k == "upload":
         common = dict(caption=job.caption, parse_mode=ParseMode.DISABLED, thumb=job.thumb,
                       progress=make_progress("ul", job.name or os.path.basename(job.path)))
         if job.name:
             common["file_name"] = job.name
         if job.send_as == "video":
-            await safe(client.send_video, TARGET, job.path, supports_streaming=True, **job.meta, **common)
+            await safe(client.send_video, target, job.path, supports_streaming=True, **job.meta, **common)
         elif job.send_as == "audio":
-            await safe(client.send_audio, TARGET, job.path, **job.meta, **common)
+            await safe(client.send_audio, target, job.path, **job.meta, **common)
         else:
-            await safe(client.send_document, TARGET, job.path, **common)
+            await safe(client.send_document, target, job.path, **common)
         running["io"]["ul"] = ""
     mark_seen(job.key)
     return "sent"
 
 
-async def handle(client: Client, work) -> str:
+async def handle(client: Client, work, target: int = None) -> str:
     """prepare() ka result lo, retry ke saath bhejo, temp files saaf karo.
     Returns: sent | skip | dup. Final failure par exception uthata hai."""
     job = None
@@ -530,7 +548,7 @@ async def handle(client: Client, work) -> str:
         job = await work
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                return await deliver(client, job)
+                return await deliver(client, job, target or default_target())
             except Exception as e:
                 if attempt >= MAX_RETRIES:
                     raise
@@ -635,8 +653,10 @@ def do_stop() -> bool:
     return True
 
 
-async def run_job(client: Client, m: Message, ids, kind: str = "range"):
+async def run_job(client: Client, m: Message, ids, kind: str = "range", target: int = None, dedupe: bool = None,
+                  media_only: bool = False):
     """ids: range ya list of message IDs. kind: 'range' (checkpoint banta hai) ya 'retry'."""
+    target = target or default_target()
     running.update(busy=True, stop=False)
     rate.update(delay=SEND_DELAY, floods=0, flood_secs=0.0)
     gate = asyncio.Event()
@@ -653,7 +673,8 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range"):
     )
     running["job"] = js
     if kind == "range":
-        state["last_job"] = {"start": first, "end": last, "last_id": first - 1, "done": False}
+        state["last_job"] = {"start": first, "end": last, "last_id": first - 1, "done": False,
+                             "target": target, "dedupe": dedupe, "media_only": media_only}
         save_state()
 
     label = f"📍 Range: <code>{first}</code> → <code>{last}</code>" if kind == "range" \
@@ -662,6 +683,7 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range"):
         "🚀 <b>Forwarding shuru ho gayi</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"{label}\n"
+        f"📥 Destination: <code>{target}</code>{' (sirf files)' if media_only else ''}\n"
         f"📊 Total message: <code>{js.total}</code>\n"
         f"⚙️ Pipeline: <code>{PREFETCH}</code> files aage se prepare hongi\n\n"
         "<i>Baaki time ka andaza kuch messages ke baad dikhega.</i>",
@@ -674,7 +696,7 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range"):
         mid, task = item
         t0 = time.monotonic()
         try:
-            res = await handle(client, task)
+            res = await handle(client, task, target)
         except Exception as e:
             res = "failed"
             print(f"msg {mid} failed: {type(e).__name__}: {e}")
@@ -719,7 +741,7 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range"):
                 await gate.wait()                       # pause
                 if running["stop"]:
                     raise StopRequested
-                pending.append((mid, asyncio.create_task(prepare(client, msg))))
+                pending.append((mid, asyncio.create_task(prepare(client, msg, target, dedupe, media_only))))
                 while len(pending) >= PREFETCH:         # window bhar gayi => sabse purani bhejo
                     await consume(pending.popleft())
                     await tick()
@@ -775,10 +797,11 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range"):
             print(f"notify failed: {e}")
 
 
-async def start_range_job(client: Client, m: Message, start_id: int, end_id: int):
+async def start_range_job(client: Client, m: Message, start_id: int, end_id: int,
+                          target: int = None, dedupe: bool = None, media_only: bool = False):
     if start_id < 1 or end_id < start_id:
         return await m.reply_text("Invalid message ID range. Start ID must be >= 1 and end ID must be >= start ID.")
-    await run_job(client, m, range(start_id, end_id + 1), "range")
+    await run_job(client, m, range(start_id, end_id + 1), "range", target, dedupe, media_only)
 
 
 # ======================================================================
@@ -789,7 +812,12 @@ USAGE = (
     "━━━━━━━━━━━━━━━━━━\n"
     "▫️ <code>/sendall</code> — source ki saari files\n"
     "▫️ <code>/sendall 500</code> — ID 500 se aage ki saari files\n"
-    "▫️ <code>/clean 100 200</code> — sirf ek range (start, end ID)\n"
+    "▫️ <code>/sendall -1001234567890</code> — saari files <b>dusre folder/channel</b> me\n"
+    "▫️ <code>/sendall @channelname</code> — public channel ko username/link se bhi de sakte ho\n"
+    "▫️ <code>/sendall -1001234567890 files</code> — sirf files (text messages skip)\n"
+    "▫️ <code>/sendall 500 -1001234567890 force</code> — ID 500 se, us channel me, duplicate check ke bina\n"
+    "▫️ <code>/clean 100 200 [channel_id] [force]</code> — sirf ek range (start, end ID)\n"
+    "▫️ <code>/setdest -100...</code> — default destination badlo (<code>/setdest reset</code> = env wala) · <code>/dest</code> — dekho\n"
     "▫️ <code>/resume</code> — roka/adhura kaam wahin se aage\n"
     "▫️ <code>/retryfailed</code> — fail hui files dobara\n"
     "▫️ <code>/status</code> · <code>/pause</code> · <code>/unpause</code> · <code>/stop</code>\n"
@@ -849,7 +877,35 @@ async def clean_cmd(client: Client, m: Message):
     if running["busy"]:
         return await m.reply_text("Ek kaam pehle se chal raha hai. /stop karo ya wait karo.")
 
-    res = await resolve_channels()
+    args = m.command[1:]
+    force = any(a.lower() in ("force", "-f") for a in args)
+    media_only = any(a.lower() in ("files", "file", "-files") for a in args)
+    ids_given = [a for a in args if re.fullmatch(r"-?\d+", a)]
+    # -100... ya koi negative number => destination channel; baaki positive numbers => message IDs
+    dest = next((int(a) for a in ids_given if a.startswith("-")), None)
+    # @username ya t.me/username link bhi destination ho sakta hai (public channel)
+    if dest is None:
+        ref = next((a for a in args if re.fullmatch(r"@\w{4,}|(?:https?://)?t\.me/\w{4,}/?", a, re.I)), None)
+        if ref:
+            uname = "@" + re.sub(r"^(?:https?://)?t\.me/|/$", "", ref.lstrip("@"), flags=re.I) if not ref.startswith("@") else ref
+            try:
+                dest = (await safe(client.get_chat, uname)).id
+            except Exception as e:
+                return await m.reply_text(f"Destination <code>{html.escape(ref)}</code> nahi mila: "
+                                          f"{html.escape(type(e).__name__)}", parse_mode=ParseMode.HTML)
+    nums = [int(a) for a in ids_given if not a.startswith("-")]
+    try:
+        if m.command[0] == "sendall" or (args and args[0].lower() == "all"):
+            start_id = nums[0] if nums else 1
+            end_id = nums[1] if len(nums) > 1 else None   # None => neeche probe se nikalenge
+        else:
+            start_id, end_id = nums[0], nums[1]
+    except IndexError:
+        return await m.reply_text(USAGE, parse_mode=ParseMode.HTML)
+    target = dest or default_target()
+    dedupe = False if force else None
+
+    res = await resolve_channels(target)
     bad = {k: v for k, v in res.items() if v}
     if bad:
         lines = "\n".join(f"{k}: {v}" for k, v in bad.items())
@@ -857,21 +913,10 @@ async def clean_cmd(client: Client, m: Message):
             "Channel access nahi mil raha:\n"
             f"{lines}\n\n"
             "Check karo:\n"
-            "1. SOURCE_CHANNEL / TARGET_CHANNEL ID sahi hai (-100 se shuru)\n"
+            "1. SOURCE_CHANNEL / destination channel ID sahi hai (-100 se shuru)\n"
             "2. Wahi bot (wahi BOT_TOKEN) dono channels me admin hai\n"
-            "3. Source me 'Post Messages' permission di hai"
+            "3. Source me 'Post Messages', destination me bhi 'Post Messages' permission di hai"
         )
-
-    args = m.command[1:]
-    nums = [int(a) for a in args if a.isdigit()]
-    try:
-        if m.command[0] == "sendall" or (args and args[0].lower() == "all"):
-            start_id = nums[0] if nums else 1
-            end_id = nums[1] if len(nums) > 1 else None   # None => neeche probe se nikalenge
-        else:
-            start_id, end_id = int(args[0]), int(args[1])
-    except (ValueError, IndexError):
-        return await m.reply_text(USAGE, parse_mode=ParseMode.HTML)
 
     if end_id is None:
         try:
@@ -884,7 +929,7 @@ async def clean_cmd(client: Client, m: Message):
                 "Bot ko source channel me admin + 'Post Messages' permission do.\n"
                 f"Error: {type(e).__name__}: {e}"
             )
-    await start_range_job(client, m, start_id, end_id)
+    await start_range_job(client, m, start_id, end_id, target, dedupe, media_only)
 
 
 @app.on_message(filters.command("resume") & filters.private & admin_filter)
@@ -894,10 +939,11 @@ async def resume_cmd(client: Client, m: Message):
     lj = state["last_job"]
     if not lj or lj.get("done") or lj["last_id"] >= lj["end"]:
         return await m.reply_text("Aisa koi adhura kaam nahi mila. /sendall se naya shuru karo.")
-    res = await resolve_channels()
+    target = lj.get("target") or default_target()
+    res = await resolve_channels(target)
     if any(res.values()):
         return await m.reply_text("Channel access nahi mil raha. Bot dono channels me admin hai ya nahi check karo.")
-    await start_range_job(client, m, lj["last_id"] + 1, lj["end"])
+    await start_range_job(client, m, lj["last_id"] + 1, lj["end"], target, lj.get("dedupe"), lj.get("media_only", False))
 
 
 @app.on_message(filters.command("retryfailed") & filters.private & admin_filter)
@@ -911,6 +957,37 @@ async def retry_cmd(client: Client, m: Message):
     if any(res.values()):
         return await m.reply_text("Channel access nahi mil raha. Bot dono channels me admin hai ya nahi check karo.")
     await run_job(client, m, ids, "retry")
+
+
+@app.on_message(filters.command("dest") & filters.private & admin_filter)
+async def dest_cmd(_, m: Message):
+    t = default_target()
+    src = "env TARGET_CHANNEL" if not state.get("target") else "/setdest"
+    await m.reply_text(f"📥 Default destination: <code>{t}</code> ({src})\n"
+                       f"📤 Source (database): <code>{SOURCE}</code>", parse_mode=ParseMode.HTML)
+
+
+@app.on_message(filters.command("setdest") & filters.private & admin_filter)
+async def setdest_cmd(_, m: Message):
+    if running["busy"]:
+        return await m.reply_text("Ek kaam chal raha hai. Pehle /stop karo ya khatam hone do.")
+    arg = (m.command[1] if len(m.command) > 1 else "").strip()
+    if arg.lower() == "reset":
+        state["target"] = None
+        save_state()
+        return await m.reply_text(f"♻️ Destination wapas env wala: <code>{TARGET}</code>", parse_mode=ParseMode.HTML)
+    if not re.fullmatch(r"-?\d+", arg):
+        return await m.reply_text("Use: <code>/setdest -1001234567890</code>  |  <code>/setdest reset</code>",
+                                  parse_mode=ParseMode.HTML)
+    cid = int(arg)
+    res = await resolve_channels(cid)
+    if res.get("TARGET"):
+        return await m.reply_text(f"Is destination tak pahunch nahi paya: {res['TARGET']}\n"
+                                  "Bot ko us channel me admin + Post Messages permission do.")
+    state["target"] = cid
+    save_state()
+    await m.reply_text(f"✅ Default destination ab <code>{cid}</code>. /sendall se saari files wahan jayengi.",
+                       parse_mode=ParseMode.HTML)
 
 
 @app.on_message(filters.command("stop") & filters.private & admin_filter)
