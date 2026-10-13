@@ -16,16 +16,24 @@ from aiohttp import web
 from PIL import Image
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import Message
 
+
 # ---------- CONFIG (environment variables) ----------
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMINS = [int(x) for x in os.environ.get("ADMINS", "").split()]   # space separated user ids
-SOURCE = int(os.environ["SOURCE_CHANNEL"])    # database channel id, e.g. -1001234567890
-TARGET = int(os.environ["TARGET_CHANNEL"])    # new channel id
+def required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+API_ID = int(required_env("API_ID"))
+API_HASH = required_env("API_HASH")
+BOT_TOKEN = required_env("BOT_TOKEN")
+ADMINS = [int(x) for x in os.environ.get("ADMINS", "").replace(",", " ").split()]
+SOURCE = int(required_env("SOURCE_CHANNEL"))  # source/database channel ID
+TARGET = int(required_env("TARGET_CHANNEL"))  # destination channel ID
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")   # free key from themoviedb.org (for posters)
 AUTO_FORWARD = os.environ.get("AUTO_FORWARD", "true").lower() == "true"
 # Default: file jaisi hai waisi forward (re-upload nahi), bas caption se @username aur telegram links hat jate hain
@@ -36,6 +44,7 @@ BLOCK_WORDS = [w.strip() for w in os.environ.get("BLOCK_WORDS", "").split(",") i
 PORT = int(os.environ.get("PORT", "8080"))    # Render health-check port
 
 app = Client("cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
 
 # ---------- CLEANING ----------
 LINK_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/\S+|tg://\S+", re.I)
@@ -123,7 +132,11 @@ async def fetch_poster(filename: str, dest: str) -> bool:
     return False
 
 
-# ---------- PROCESSING ----------
+# ---------- HELPERS ----------
+class StopRequested(Exception):
+    """/stop dabane par kaam rokne ke liye."""
+
+
 async def safe(coro_fn, *args, **kwargs):
     while True:
         try:
@@ -132,9 +145,35 @@ async def safe(coro_fn, *args, **kwargs):
             await asyncio.sleep(e.value + 1)
 
 
+async def safe_edit(message: Message, text: str):
+    """Status message edit karo; fail ho to kaam na ruke."""
+    try:
+        await safe(message.edit_text, text)
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        print(f"status edit failed: {e}")
+
+
+async def resolve_channels() -> dict:
+    """SOURCE aur TARGET ko resolve karo taaki Pyrogram peer cache me save kar le.
+    Returns {name: error_or_None}."""
+    results = {}
+    for name, cid in (("SOURCE", SOURCE), ("TARGET", TARGET)):
+        try:
+            chat = await safe(app.get_chat, cid)
+            print(f"{name} OK: {chat.title} ({chat.id})")
+            results[name] = None
+        except Exception as e:
+            print(f"{name} FAILED ({cid}): {e}")
+            results[name] = f"{type(e).__name__}: {e}"
+    return results
+
+
+# ---------- PROCESSING ----------
 async def process(client: Client, msg: Message) -> bool:
     """Clean one message and post it to TARGET. Returns True if something was sent."""
-    if msg.empty:
+    if msg.empty or msg.service:
         return False
 
     media = msg.document or msg.video or msg.audio
@@ -164,7 +203,7 @@ async def process(client: Client, msg: Message) -> bool:
     if msg.text:
         t = clean_text(msg.text) if CLEAN_CAPTION else msg.text
         if t:
-            await safe(client.send_message, TARGET, t)
+            await safe(client.send_message, TARGET, t, parse_mode=ParseMode.DISABLED)
             return True
         return False
     if msg.photo:
@@ -172,7 +211,10 @@ async def process(client: Client, msg: Message) -> bool:
         return True
 
     if not media:
-        return False
+        # voice, sticker, animation etc. - seedha copy kar do
+        await safe(client.copy_message, TARGET, SOURCE, msg.id,
+                   caption=caption, parse_mode=ParseMode.DISABLED, reply_markup=None)
+        return True
 
     old = media.file_name or "file"
     new = clean_filename(old) if CLEAN_FILENAME else old
@@ -217,7 +259,16 @@ async def process(client: Client, msg: Message) -> bool:
 
 # ---------- COMMANDS ----------
 running = {"stop": False, "busy": False}
-admin_filter = filters.user(ADMINS) if ADMINS else filters.all
+# Fail closed: if ADMINS is empty, nobody can run history-processing commands.
+admin_filter = filters.user(ADMINS) if ADMINS else filters.user([])
+
+USAGE = (
+    "Use:\n"
+    "/sendall - source channel ki saari files\n"
+    "/sendall <start_id> - kisi id se aage ki saari files\n"
+    "/clean <start_id> <end_id> - ek range\n\n"
+    "(Saari files ke liye bot ko source channel me admin + Post Messages permission chahiye)"
+)
 
 
 @app.on_message(filters.command("start") & filters.private)
@@ -234,35 +285,53 @@ async def start(_, m: Message):
 async def clean_cmd(client: Client, m: Message):
     if running["busy"]:
         return await m.reply_text("Ek kaam pehle se chal raha hai. /stop karo ya wait karo.")
+
+    # 1) Channels access check (peer cache)
+    res = await resolve_channels()
+    bad = {k: v for k, v in res.items() if v}
+    if bad:
+        lines = "\n".join(f"{k}: {v}" for k, v in bad.items())
+        return await m.reply_text(
+            "Channel access nahi mil raha:\n"
+            f"{lines}\n\n"
+            "Check karo:\n"
+            "1. SOURCE_CHANNEL / TARGET_CHANNEL ID sahi hai (-100 se shuru)\n"
+            "2. Wahi bot (wahi BOT_TOKEN) dono channels me admin hai\n"
+            "3. Source me 'Post Messages' permission di hai"
+        )
+
+    # 2) Args parse
     args = m.command[1:]
     try:
         if m.command[0] == "sendall" or (args and args[0].lower() == "all"):
-            # Find the latest source message without posting a temporary message.
-            # This avoids requiring "Post Messages" permission in the source channel.
             nums = [a for a in args if a.isdigit()]
             start_id = int(nums[0]) if nums else 1
-            end_id = 0
-            async for latest_msg in client.get_chat_history(SOURCE, limit=1):
-                end_id = latest_msg.id
-                break
-            if end_id == 0:
-                return await m.reply_text(
-                    "Source channel ki history nahi mil rahi. SOURCE_CHANNEL ID check karo "
-                    "aur bot ko source channel mein add/admin karo."
-                )
+            end_id = None  # neeche probe se nikalenge
         else:
             start_id, end_id = int(args[0]), int(args[1])
-    except Exception as e:
-        return await m.reply_text(
-            "Use:\n/sendall - source channel ki saari files\n/sendall <start_id> - kisi id se aage ki saari files\n"
-            "/clean <start_id> <end_id> - ek range\n\n"
-            "(Saari files ke liye bot ko source channel me admin + Post Messages permission chahiye)\n"
-            f"Error: {e}"
-        )
+    except (ValueError, IndexError):
+        return await m.reply_text(USAGE)
+
+    # 3) Last message id nikalo (sendall ke liye)
+    if end_id is None:
+        try:
+            probe = await safe(client.send_message, SOURCE, ".")
+            end_id = probe.id - 1
+            await safe(client.delete_messages, SOURCE, probe.id)
+        except Exception as e:
+            return await m.reply_text(
+                "Source channel me test message nahi bhej paya.\n"
+                "Bot ko source channel me admin + 'Post Messages' permission do.\n"
+                f"Error: {type(e).__name__}: {e}"
+            )
+
+    if start_id < 1 or end_id < start_id:
+        return await m.reply_text("Invalid message ID range. Start ID must be >= 1 and end ID must be >= start ID.")
 
     running.update(busy=True, stop=False)
     status = await m.reply_text("Shuru ho gaya...")
     sent = skipped = failed = 0
+    last_id = start_id - 1
 
     try:
         for chunk_start in range(start_id, end_id + 1, 100):
@@ -270,7 +339,8 @@ async def clean_cmd(client: Client, m: Message):
             msgs = await safe(client.get_messages, SOURCE, ids)
             for msg in msgs:
                 if running["stop"]:
-                    raise asyncio.CancelledError
+                    raise StopRequested
+                last_id = getattr(msg, "id", last_id)
                 try:
                     if await process(client, msg):
                         sent += 1
@@ -278,13 +348,26 @@ async def clean_cmd(client: Client, m: Message):
                         skipped += 1
                 except Exception as e:
                     failed += 1
-                    print(f"msg {msg.id} failed: {e}")
+                    print(f"msg {getattr(msg, 'id', '?')} failed: {e}")
                 await asyncio.sleep(1)  # flood se bachne ke liye
-            await status.edit_text(f"Chal raha hai... ID {ids[-1]}/{end_id}\n"
-                                   f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}")
-        await status.edit_text(f"Ho gaya ✅\nSent: {sent} | Skipped: {skipped} | Failed: {failed}")
-    except asyncio.CancelledError:
-        await status.edit_text(f"Roka gaya ⛔ (last ID: {msg.id})\nSent: {sent} | Skipped: {skipped} | Failed: {failed}\nAage badhane ke liye: /sendall {msg.id}")
+            await safe_edit(status, f"Chal raha hai... ID {ids[-1]}/{end_id}\n"
+                                    f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}")
+        await safe_edit(status, f"Ho gaya ✅\nSent: {sent} | Skipped: {skipped} | Failed: {failed}")
+    except StopRequested:
+        await safe_edit(
+            status,
+            f"Roka gaya ⛔ (last ID: {last_id})\n"
+            f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}\n"
+            f"Aage badhane ke liye: /sendall {last_id + 1}"
+        )
+    except Exception as e:
+        print(f"clean_cmd crashed: {e}")
+        await safe_edit(
+            status,
+            f"Error aa gaya ❌ (last ID: {last_id})\n{type(e).__name__}: {e}\n"
+            f"Sent: {sent} | Skipped: {skipped} | Failed: {failed}\n"
+            f"Dobara shuru: /sendall {last_id + 1}"
+        )
     finally:
         running["busy"] = False
 
@@ -297,7 +380,7 @@ async def stop_cmd(_, m: Message):
 
 # new posts in the source channel get cleaned and shared automatically
 if AUTO_FORWARD:
-    @app.on_message(filters.chat(SOURCE) & (filters.document | filters.video | filters.audio))
+    @app.on_message(filters.chat(SOURCE) & (filters.document | filters.video | filters.audio | filters.photo))
     async def auto(client: Client, m: Message):
         try:
             await process(client, m)
@@ -317,6 +400,10 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     await app.start()
+
+    # Channels ko startup pe resolve karo taaki peer cache ho jaye (Peer id invalid fix)
+    await resolve_channels()
+
     print("Bot started")
     await asyncio.Event().wait()
 
