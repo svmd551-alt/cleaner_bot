@@ -8,6 +8,7 @@ import shutil
 import asyncio
 import difflib
 import tempfile
+import mimetypes
 from collections import deque
 from io import BytesIO
 from types import SimpleNamespace
@@ -20,7 +21,7 @@ except RuntimeError:
 
 import aiohttp
 from aiohttp import web
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 from pyrogram import Client, filters, errors as tg_errors
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, MessageNotModified
@@ -50,7 +51,13 @@ ADMINS = [int(x) for x in os.environ.get("ADMINS", "").replace(",", " ").split()
 SOURCE = int(required_env("SOURCE_CHANNEL"))   # source/database channel ID
 TARGET = int(required_env("TARGET_CHANNEL"))   # normal destination channel ID
 QUALITY_TARGET = int(os.environ["QUALITY_TARGET_CHANNEL"].strip()) if os.environ.get("QUALITY_TARGET_CHANNEL", "").strip() else None  # CAM/TS/TC etc. destination
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")           # free key from themoviedb.org (posters)
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip()    # free key from themoviedb.org (posters)
+TMDB_API = os.environ.get("TMDB_API_BASE", "https://api.themoviedb.org/3").rstrip("/")   # TMDB block ho to proxy yahan
+TMDB_IMG = os.environ.get("TMDB_IMAGE_BASE", "https://image.tmdb.org/t/p").rstrip("/")
+OCR_SPACE_KEY = os.environ.get("OCR_SPACE_KEY", "").strip()  # free key ocr.space se (jahan tesseract install nahi hota)
+OCR_MIN_SCORE = float(os.environ.get("OCR_MIN_SCORE", "0.8"))   # poster se padhe naam ka TMDB match kitna strict ho
+AUTO_RESUME = env_bool("AUTO_RESUME", True)                   # restart/error ke baad adhura kaam khud resume
+MAX_AUTO_RESUMES = max(1, int(os.environ.get("MAX_AUTO_RESUMES", "5")))   # bina progress ke max kitni baar khud resume
 BLOCK_WORDS = [w.strip() for w in os.environ.get("BLOCK_WORDS", "").split(",") if w.strip()]
 PORT = int(os.environ.get("PORT", "8080"))                   # Render health-check port
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()   # Render sets this itself (keep-alive ping)
@@ -72,12 +79,14 @@ rate = {"delay": SEND_DELAY, "floods": 0, "flood_secs": 0.0}
 cfg = {
     "clean_caption": env_bool("CLEAN_CAPTION", True),    # caption se @username / t.me links hatao
     "clean_filename": env_bool("CLEAN_FILENAME", True),  # file ke naam se username hatao (re-upload lagega)
-    "set_poster": env_bool("SET_POSTER", False),         # video pe TMDB poster thumbnail (abhi OFF - API key nahi hai)
+    "set_poster": env_bool("SET_POSTER", True),          # video pe TMDB poster thumbnail (abhi OFF - API key nahi hai)
     "dedupe": env_bool("DEDUPE", True),                  # pehle bheji hui file dobara na bhejo
     "auto": env_bool("AUTO_FORWARD", True),              # source me nayi post aate hi auto forward
     "notify": env_bool("NOTIFY", True),                  # kaam khatam hone par alag message (ping)
     "delete_quality": env_bool("DELETE_QUALITY", False), # CAM/HDTS/HDTC file quality channel me jaane ke baad source se delete
     "auto_caption": env_bool("AUTO_CAPTION", True),      # caption khaali ho to TMDB se khud likho (TMDB_API_KEY chahiye)
+    "hd_poster": env_bool("HD_POSTER", False),           # movie ke saath TMDB ka bada (HD) poster alag photo me bhi bhejo
+    "name_from_poster": env_bool("NAME_FROM_POSTER", True),  # video me naam na ho to poster (thumbnail) se naam padho (OCR)
 }
 SETTING_LABELS = {
     "clean_caption": "🧹 Clean caption",
@@ -88,6 +97,8 @@ SETTING_LABELS = {
     "notify": "🔔 Notify on finish",
     "delete_quality": "🗑 Delete quality files from source",
     "auto_caption": "📝 Auto caption (jahan caption nahi)",
+    "hd_poster": "🖼 HD poster photo (video ke upar alag)",
+    "name_from_poster": "🔎 Poster se naam padho (naam na ho to)",
 }
 
 app = Client("cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
@@ -106,6 +117,7 @@ state = {
     "cfg": {},
     "last_job": None,    # {"start","end","last_id","done"} - /resume ke liye
     "totals": {"sent": 0, "dup": 0, "failed": 0},
+    "resume_tries": 0,   # bina progress ke auto-resume kitni baar hua
 }
 seen: set = set()        # file_unique_id of already-sent files
 dirty = [0]
@@ -132,7 +144,7 @@ def load_state():
     except Exception as e:
         print(f"state load failed: {e}")
         return
-    for k in ("blocks", "failed", "footer", "last_job", "target"):
+    for k in ("blocks", "failed", "footer", "last_job", "target", "resume_tries"):
         if k in data:
             state[k] = data[k]
     state["totals"].update(data.get("totals", {}))
@@ -158,14 +170,20 @@ def save_state():
 
 
 def maybe_save(force: bool = False):
-    if force or dirty[0] >= 25:
+    if force or dirty[0] >= 10:
         save_state()
 
 
 # ======================================================================
 #  CLEANING
 # ======================================================================
-LINK_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/\S+|tg://\S+", re.I)
+# Hatane wale link domains: mdisk hamesha; aur chahiye to env EXTRA_LINK_DOMAINS="site1.com,site2.net"
+_EXTRA_DOMAINS = [d.strip().lower() for d in os.environ.get("EXTRA_LINK_DOMAINS", "").split(",") if d.strip()]
+_LINK_DOMAINS = "|".join([r"mdisk\.[a-z]{2,}"] + [re.escape(d) for d in _EXTRA_DOMAINS])
+LINK_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/\S+|tg://\S+"
+                     r"|(?:https?://)?(?:[\w-]+\.)*(?:" + _LINK_DOMAINS + r")(?:/\S*)?", re.I)
+# link hatane ke baad bacha hua akela label ("Online Play link:") bhi hatao
+LINK_LABEL_RE = re.compile(r"^\W*(?:online\s+)?(?:play|watch|stream|download|direct|mdisk)\s*(?:link|url)?s?\W*$", re.I)
 WWW_RE = re.compile(r"\bwww\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b", re.I)
 USER_RE = re.compile(r"@[A-Za-z0-9_]+")
 # Remove low-quality/cinema-recording tags from both captions and filenames.
@@ -221,7 +239,12 @@ def rebuild_block_re():
     block_re = re.compile("@?(?:" + "|".join(map(re.escape, words)) + ")", re.I) if words else None
 
 
+def clean_text_changed(original: str, lines) -> bool:
+    return "\n".join(lines) != "\n".join(l.strip() for l in original.splitlines())
+
+
 def clean_text(text: str) -> str:
+    original = text
     text = clean_quality_tags(text)
     text = LINK_RE.sub("", text)
     text = WWW_RE.sub("", text)
@@ -229,6 +252,9 @@ def clean_text(text: str) -> str:
         text = block_re.sub("", text)
     text = USER_RE.sub("", text)
     lines = [re.sub(r"[ \t]{2,}", " ", l).strip() for l in text.splitlines()]
+    lines = [l for l in lines if not LINK_LABEL_RE.match(l)]
+    if clean_text_changed(original, lines):      # "❤️ @user ❤️" -> sirf emoji bachte hain, wo line bhi hatao
+        lines = [l for l in lines if not l or re.search(r"\w", l)]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
@@ -262,7 +288,7 @@ def build_caption(raw: str, limit: int = 1024, footer: bool = True) -> str:
 
 
 # ======================================================================
-#  POSTER (TMDB) - best-match + cache
+#  POSTER (TMDB) - best-match + cache, aur "poster se naam" (OCR)
 # ======================================================================
 JUNK_RE = re.compile(
     r"\b(480p|576p|720p|1080p|2160p|4k|hdrip|webrip|web-dl|webdl|web|bluray|brrip|bdrip|dvdrip|"
@@ -272,8 +298,9 @@ JUNK_RE = re.compile(
     re.I,
 )
 SERIES_RE = re.compile(r"\bs\d{1,2}\s?e\d{1,3}\b|\bseason\b", re.I)
-poster_cache: dict = {}   # (title, year) -> jpeg bytes | None (match nahi mila)
-info_cache: dict = {}     # (title, year) -> dict(title, year, rating, genres, overview, lang) | None
+poster_cache: dict = {}   # poster_path -> jpeg bytes
+lookup_cache: dict = {}   # (title, year, min_score) -> info dict | None (match nahi mila)
+ocr_cache: dict = {}      # thumbnail file_unique_id -> info dict | None
 
 GENRES = {28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime", 99: "Documentary",
           18: "Drama", 10751: "Family", 14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
@@ -284,9 +311,28 @@ QUALITY_INFO_RE = re.compile(r"\b(480p|576p|720p|1080p|2160p|4k|hdrip|webrip|web
                              r"dvdrip|hdtv|x264|x265|hevc|10bit|esubs?|dual audio|hindi|english|tamil|telugu|"
                              r"malayalam|kannada|punjabi|bengali)\b", re.I)
 
+# Sirf asli media extension hatao (pehle os.path.splitext tha: "Mr. Bean" ka ". Bean" extension ban jata tha)
+MEDIA_EXT_RE = re.compile(r"\.(mkv|mp4|avi|mov|webm|m4v|ts|flv|wmv|mpg|mpeg|3gp|mp3|m4a|flac|aac|ogg|zip|rar|7z)$", re.I)
+# "VID_2023", "video", "file (1)" jaise naam = koi asli naam nahi
+GENERIC_WORDS = {"vid", "video", "videos", "file", "movie", "document", "doc", "audio", "img", "image", "mov",
+                 "untitled", "new", "clip", "film", "download", "telegram", "whatsapp", "screen", "recording"}
+# Poster pe aam likha hua text jo title nahi hota
+OCR_SKIP_WORDS = {"hindi", "dubbed", "english", "tamil", "telugu", "movie", "movies", "full", "hd", "new",
+                  "official", "poster", "trailer", "presents", "starring", "directed", "download", "watch",
+                  "only", "theatres", "theaters", "cinemas", "coming", "soon", "dual", "audio", "www", "com",
+                  "in", "the", "a", "of", "and", "by", "from", "film"}
+
+
+def is_generic_title(title: str) -> bool:
+    if re.fullmatch(r"\d{1,4}", (title or "").strip()):
+        return False                      # "300", "1917" jaisi movies
+    words = re.findall(r"[A-Za-z]{2,}", title or "")
+    return not [w for w in words if w.lower() not in GENERIC_WORDS]
+
 
 def guess_title(filename: str):
-    base = re.sub(r"[._]+", " ", os.path.splitext(filename)[0])
+    name = MEDIA_EXT_RE.sub("", filename or "")
+    base = re.sub(r"[._]+", " ", name)
     base = LINK_RE.sub("", base)
     base = USER_RE.sub("", base)
     year = None
@@ -301,98 +347,377 @@ def guess_title(filename: str):
     return base, year
 
 
-async def tmdb_poster_bytes(title: str, year, filename: str):
-    """TMDB me search karke sabse milta-julta poster (JPEG bytes). Network error par exception uthata hai."""
-    kinds = ("tv", "movie") if SERIES_RE.search(filename) else ("movie", "tv")
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        for kind in kinds:
-            for use_year in ((True, False) if year else (False,)):
-                params = {"api_key": TMDB_API_KEY, "query": title}
-                if use_year:
-                    params["year" if kind == "movie" else "first_air_date_year"] = year
-                async with s.get(f"https://api.themoviedb.org/3/search/{kind}", params=params) as r:
-                    if r.status != 200:
-                        raise RuntimeError(f"TMDB HTTP {r.status}")
-                    data = await r.json()
-                best, best_score = None, 0.0
-                for res in data.get("results", [])[:8]:
-                    if not res.get("poster_path"):
-                        continue
-                    names = [res.get("title") or res.get("name") or "",
-                             res.get("original_title") or res.get("original_name") or ""]
-                    score = max(difflib.SequenceMatcher(None, title.lower(), n.lower()).ratio() for n in names)
-                    if score > best_score:
-                        best, best_score = res, score
-                if best and best_score >= 0.5:    # galat poster se behtar hai koi poster na ho
-                    date = best.get("release_date") or best.get("first_air_date") or ""
-                    info_cache[(title.lower(), year)] = dict(
-                        title=best.get("title") or best.get("name") or title,
-                        year=date[:4] or year or "",
-                        rating=best.get("vote_average") or 0,
-                        genres=[GENRES[g] for g in best.get("genre_ids", []) if g in GENRES][:3],
-                        overview=(best.get("overview") or "").strip(),
-                        lang=(best.get("original_language") or "").upper(),
-                        tv=(kind == "tv"),
-                    )
-                    async with s.get(f"https://image.tmdb.org/t/p/w342{best['poster_path']}") as img:
-                        raw = await img.read()
-                    im = Image.open(BytesIO(raw)).convert("RGB")
-                    im.thumbnail((320, 320))
-                    buf = BytesIO()
-                    im.save(buf, "JPEG", quality=85)   # Telegram: JPEG, <200KB, max 320px
-                    return buf.getvalue()
+def usable_title(text) -> bool:
+    """Is text se koi asli movie/series ka naam nikal sakta hai?"""
+    if not text:
+        return False
+    title, _ = guess_title(text)
+    return len(title) >= 2 and not is_generic_title(title)
+
+
+def title_score(a: str, b: str) -> float:
+    norm = lambda s: re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+    return difflib.SequenceMatcher(None, norm(a), norm(b)).ratio()
+
+
+# ---------- TMDB API ----------
+def tmdb_auth():
+    """v3 'API Key' ya v4 'API Read Access Token' (eyJ...) - dono chalte hain."""
+    key = TMDB_API_KEY.strip()
+    if key.startswith("eyJ") or len(key) > 60:
+        return {}, {"Authorization": f"Bearer {key}"}
+    return {"api_key": key}, {}
+
+
+async def tmdb_get(session, path: str, **params):
+    base, headers = tmdb_auth()
+    last = None
+    for attempt in range(2):
+        try:
+            async with session.get(f"{TMDB_API}/{path}", params={**base, **params}, headers=headers) as r:
+                if r.status == 401:
+                    raise RuntimeError("TMDB HTTP 401 - TMDB_API_KEY galat hai (v3 API Key ya v4 Read Access Token dalo)")
+                if r.status == 429:
+                    last = RuntimeError("TMDB HTTP 429 (rate limit)")
+                    await asyncio.sleep(2)
+                    continue
+                if r.status != 200:
+                    raise RuntimeError(f"TMDB HTTP {r.status}")
+                return await r.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last = e
+            await asyncio.sleep(1)
+    raise RuntimeError(f"TMDB network error: {type(last).__name__}: {last}")
+
+
+def info_from(res: dict, kind: str, title: str, year, score: float) -> dict:
+    date = res.get("release_date") or res.get("first_air_date") or ""
+    return dict(
+        title=res.get("title") or res.get("name") or title,
+        year=date[:4] or year or "",
+        rating=res.get("vote_average") or 0,
+        genres=[GENRES[g] for g in res.get("genre_ids", []) if g in GENRES][:3],
+        overview=(res.get("overview") or "").strip(),
+        lang=(res.get("original_language") or "").upper(),
+        tv=(kind == "tv"),
+        poster_path=res.get("poster_path"),
+        score=score,
+    )
+
+
+async def tmdb_find(session, title: str, year, filename: str = "", min_score: float = 0.5):
+    kinds = ("tv", "movie") if SERIES_RE.search(filename or title) else ("movie", "tv")
+    for kind in kinds:
+        for use_year in ((True, False) if year else (False,)):
+            params = {"query": title, "include_adult": "false"}
+            if use_year:
+                params["year" if kind == "movie" else "first_air_date_year"] = year
+            data = await tmdb_get(session, f"search/{kind}", **params)
+            best, best_score = None, 0.0
+            for res in data.get("results", [])[:8]:
+                if not res.get("poster_path"):
+                    continue
+                names = [n for n in (res.get("title") or res.get("name") or "",
+                                     res.get("original_title") or res.get("original_name") or "") if n]
+                if not names:
+                    continue
+                score = max(title_score(title, n) for n in names)
+                if score > best_score:
+                    best, best_score = res, score
+            if best and best_score >= min_score:    # galat poster se behtar hai koi poster na ho
+                return info_from(best, kind, title, year, best_score)
     return None
 
 
-async def fetch_poster(filename: str, dest: str) -> bool:
+async def tmdb_lookup(title: str, year=None, filename: str = "", min_score: float = 0.5):
+    """TMDB me naam se best match (info dict) ya None. Network/key error par exception uthata hai."""
     if not TMDB_API_KEY:
+        return None
+    key = (title.lower(), year, round(min_score, 2))
+    if key in lookup_cache:
+        return lookup_cache[key]
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        info = await tmdb_find(s, title, year, filename, min_score)
+    if len(lookup_cache) > 500:
+        lookup_cache.pop(next(iter(lookup_cache)))
+    lookup_cache[key] = info
+    return info
+
+
+async def tmdb_poster_raw(poster_path: str, size: str = "w500") -> bytes:
+    """TMDB se poster, jaisa hai waisa (w500 = thumbnail ke liye, w780 = HD photo post ke liye)."""
+    ckey = size + poster_path
+    if ckey in poster_cache:
+        return poster_cache[ckey]
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        async with s.get(f"{TMDB_IMG}/{size}{poster_path}") as r:
+            if r.status != 200:
+                raise RuntimeError(f"TMDB image HTTP {r.status}")
+            raw = await r.read()
+    if len(poster_cache) > 100:
+        poster_cache.pop(next(iter(poster_cache)))
+    poster_cache[ckey] = raw
+    return raw
+
+
+def _jpeg_under_limit(im) -> bytes:
+    data = b""
+    for q in (95, 90, 82, 72, 60):          # Telegram thumbnail: JPEG, <200KB
+        buf = BytesIO()
+        im.save(buf, "JPEG", quality=q, subsampling=0, optimize=True)
+        data = buf.getvalue()
+        if len(data) < 195_000:
+            break
+    return data
+
+
+def make_thumb(raw: bytes, vw: int = 0, vh: int = 0) -> bytes:
+    """Poster ko video ke aspect ratio ke canvas me rakho (Telegram thumbnail ko video ke size me fit/crop karta hai,
+    to seedha portrait poster lagane par beech ka hissa kat jata hai). Max 320px - ye Telegram ki hard limit hai."""
+    poster = Image.open(BytesIO(raw)).convert("RGB")
+    pw, ph = poster.size
+    if not (vw and vh):
+        poster.thumbnail((320, 320), Image.LANCZOS)
+        return _jpeg_under_limit(poster)
+    if vw >= vh:
+        cw, ch = 320, max(2, round(320 * vh / vw))
+    else:
+        cw, ch = max(2, round(320 * vw / vh)), 320
+    if abs((cw / ch) - (pw / ph)) < 0.12:          # ratio pehle se milta hai
+        return _jpeg_under_limit(poster.resize((cw, ch), Image.LANCZOS))
+    bg = ImageOps.fit(poster, (cw, ch), Image.LANCZOS).filter(ImageFilter.GaussianBlur(10))
+    bg = Image.blend(bg, Image.new("RGB", (cw, ch), (0, 0, 0)), 0.45)
+    fg_h = ch if ch <= cw else ch
+    fg_w = max(1, round(pw * fg_h / ph))
+    if fg_w > cw:
+        fg_w, fg_h = cw, max(1, round(ph * cw / pw))
+    fg = poster.resize((fg_w, fg_h), Image.LANCZOS)    # poster poora dikhe (title kate nahi)
+    bg.paste(fg, ((cw - fg_w) // 2, (ch - fg_h) // 2))
+    return _jpeg_under_limit(bg)
+
+
+async def tmdb_poster_by_path(poster_path: str, size=(0, 0)) -> bytes:
+    return make_thumb(await tmdb_poster_raw(poster_path), *size)
+
+
+async def save_poster(info, dest: str, size=(0, 0)) -> bool:
+    if not info or not info.get("poster_path"):
         return False
-    title, year = guess_title(filename)
-    if len(title) < 2:
-        return False
-    key = (title.lower(), year)
     try:
-        if key not in poster_cache:
-            data = await tmdb_poster_bytes(title, year, filename)
-            if len(poster_cache) > 500:
-                poster_cache.pop(next(iter(poster_cache)))
-            poster_cache[key] = data
-        data = poster_cache[key]
-        if not data:
-            return False
+        data = await tmdb_poster_by_path(info["poster_path"], size)
         with open(dest, "wb") as f:
             f.write(data)
         return True
     except Exception as e:
-        print(f"poster fetch failed for '{title}': {e}")
+        print(f"poster download failed for '{info.get('title')}': {e}")
         return False
 
 
-async def auto_caption(msg: Message) -> str:
-    """Caption khaali ho to TMDB se title/saal/rating/genre/story likho. Match na mile to '' (caption khaali hi rahega)."""
-    if not (cfg["auto_caption"] and TMDB_API_KEY):
-        return ""
-    media = msg.document or msg.video or msg.audio
-    fname = getattr(media, "file_name", "") if media else ""
-    if not fname:
-        return ""
-    title, year = guess_title(fname)
-    if len(title) < 2:
-        return ""
-    key = (title.lower(), year)
+async def identify_from_text(texts):
+    """File ke naam / caption ki pehli line se TMDB match. Pehla jo mil jaye wahi."""
+    for t in texts:
+        if not usable_title(t):
+            continue
+        title, year = guess_title(t)
+        try:
+            info = await tmdb_lookup(title, year, t)
+        except Exception as e:
+            print(f"TMDB lookup failed for '{title}': {e}")
+            continue
+        if info:
+            return info
+    return None
+
+
+# ---------- poster (thumbnail) se naam padhna: OCR ----------
+def _ocr_prep(path: str):
+    im = Image.open(path).convert("L")
+    w, h = im.size
+    scale = max(1, 1100 // max(w, h, 1))      # chhota thumbnail bada karo, warna OCR kharab padhta hai
+    if scale > 1:
+        im = im.resize((w * scale, h * scale), Image.LANCZOS)
+    return ImageOps.autocontrast(im)
+
+
+def _ocr_local(path: str):
+    """Server pe tesseract installed ho to. Returns [(line_text, text_height)]."""
+    import pytesseract
+    base = _ocr_prep(path)
+    lines = []
+    for img in (base, ImageOps.invert(base)):         # kaala aur safed, dono tarah ka text
+        d = pytesseract.image_to_data(img, config="--psm 11", output_type=pytesseract.Output.DICT)
+        groups = {}
+        for i, word in enumerate(d["text"]):
+            word = (word or "").strip()
+            try:
+                conf = float(d["conf"][i])
+            except (TypeError, ValueError):
+                conf = -1
+            if not word or conf < 40:
+                continue
+            g = groups.setdefault((d["block_num"][i], d["par_num"][i], d["line_num"][i]), {"w": [], "h": 0})
+            g["w"].append(word)
+            g["h"] = max(g["h"], int(d["height"][i]))
+        lines += [(" ".join(g["w"]), g["h"]) for g in groups.values()]
+    return lines
+
+
+async def _ocr_space(path: str):
+    """Free OCR.space API (OCR_SPACE_KEY chahiye) - Render jaisi jagah jahan tesseract install nahi hota."""
+    img = _ocr_prep(path)
+    buf = BytesIO()
+    img.save(buf, "JPEG", quality=90)
+    form = aiohttp.FormData()
+    form.add_field("apikey", OCR_SPACE_KEY)
+    form.add_field("isOverlayRequired", "true")
+    form.add_field("OCREngine", "2")
+    form.add_field("scale", "true")
+    form.add_field("file", buf.getvalue(), filename="poster.jpg", content_type="image/jpeg")
+    timeout = aiohttp.ClientTimeout(total=45)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        async with s.post("https://api.ocr.space/parse/image", data=form) as r:
+            data = await r.json(content_type=None)
+    if data.get("IsErroredOnProcessing"):
+        err = data.get("ErrorMessage")
+        raise RuntimeError(str(err[0] if isinstance(err, list) and err else err or "OCR.space error")[:200])
+    lines = []
+    for pr in data.get("ParsedResults") or []:
+        overlay = (pr.get("TextOverlay") or {}).get("Lines") or []
+        for ln in overlay:
+            lines.append((ln.get("LineText") or "", int(float(ln.get("MaxHeight") or 0))))
+        if not overlay:
+            lines += [(t, 0) for t in (pr.get("ParsedText") or "").splitlines()]
+    return lines
+
+
+def ocr_status() -> str:
+    if shutil.which("tesseract"):
+        try:
+            import pytesseract  # noqa: F401
+            return "local tesseract"
+        except ImportError:
+            pass
+    return "OCR.space" if OCR_SPACE_KEY else "NOT available"
+
+
+_ocr_warned = [False]
+
+
+async def get_ocr_lines(path: str):
+    loop = asyncio.get_running_loop()
+    if ocr_status() == "local tesseract":
+        try:
+            return await loop.run_in_executor(None, _ocr_local, path)
+        except Exception as e:
+            print(f"local OCR failed: {type(e).__name__}: {e}")
+    if OCR_SPACE_KEY:
+        try:
+            return await _ocr_space(path)
+        except Exception as e:
+            print(f"OCR.space failed: {type(e).__name__}: {e}")
+    elif not _ocr_warned[0]:
+        _ocr_warned[0] = True
+        print("Poster OCR available nahi: server pe tesseract install karo ya OCR_SPACE_KEY set karo")
+    return []
+
+
+def title_candidates(lines, limit: int = 7):
+    """OCR lines [(text, height)] -> TMDB me try karne layak naam. Sabse bada likha hua text (title) pehle."""
+    good = []
+    for idx, (text, h) in enumerate(lines):
+        t = re.sub(r"[^A-Za-z0-9:'&\- ]+", " ", text or "")
+        t = re.sub(r"\s{2,}", " ", t).strip(" -:'")
+        letters = sum(c.isalpha() for c in t)
+        if letters < 3 or letters / len(t) < 0.6:
+            continue
+        if all(w in OCR_SKIP_WORDS for w in re.findall(r"[a-z]+", t.lower())):
+            continue
+        good.append((idx, t, h))
+    uniq = {}                              # normal + inverted OCR pass ek hi line do baar de sakte hain
+    for idx, t, h in good:
+        k = t.lower()
+        if k not in uniq or h > uniq[k][2]:
+            uniq[k] = (idx, t, h)
+    by_height = sorted(uniq.values(), key=lambda x: (-x[2], x[0]))
+    cands = [t for _, t, _ in by_height[:5]]
+    for n in (2, 3):                      # title do-teen lines me ho sakta hai ("THE DARK" + "KNIGHT")
+        top = sorted(by_height[:n], key=lambda x: x[0])
+        if len(top) == n:
+            cands.append(" ".join(t for _, t, _ in top))
+    out, seen_c = [], set()
+    for c in cands:
+        if c.lower() not in seen_c:
+            seen_c.add(c.lower())
+            out.append(c)
+    return out[:limit]
+
+
+async def identify_from_thumb(client: Client, media, debug: dict = None):
+    """Video ke thumbnail (poster) pe likha naam OCR se padho, phir TMDB me confirm karo."""
+    if not (TMDB_API_KEY and cfg["name_from_poster"]):
+        return None
+    thumbs = getattr(media, "thumbs", None)
+    if not thumbs:
+        return None
+    t = max(thumbs, key=lambda x: (getattr(x, "width", 0) or 0) * (getattr(x, "height", 0) or 0))
+    ukey = getattr(t, "file_unique_id", None) or t.file_id
+    if debug is None and ukey in ocr_cache:
+        return ocr_cache[ukey]
+    tmp = tempfile.mkdtemp()
     try:
-        if key not in poster_cache:
-            data = await tmdb_poster_bytes(title, year, fname)
-            if len(poster_cache) > 500:
-                poster_cache.pop(next(iter(poster_cache)))
-            poster_cache[key] = data
+        path = await safe(client.download_media, t.file_id, file_name=os.path.join(tmp, "thumb.jpg"))
+        if not path:
+            return None
+        lines = await get_ocr_lines(path)
+        cands = title_candidates(lines)
+        print(f"poster OCR lines={[x[0] for x in lines][:8]} candidates={cands}")
+        if debug is not None:
+            debug["lines"], debug["cands"] = lines, cands
+        best = None
+        for c in cands:
+            try:
+                info = await tmdb_lookup(c, None, "", min_score=OCR_MIN_SCORE)
+            except Exception as e:
+                print(f"TMDB lookup (OCR) failed for '{c}': {e}")
+                continue
+            if info and (best is None or info["score"] > best["score"]):
+                best = info
+                if info["score"] >= 0.95:
+                    break
+        if len(ocr_cache) > 500:
+            ocr_cache.pop(next(iter(ocr_cache)))
+        ocr_cache[ukey] = best
+        return best
     except Exception as e:
-        print(f"auto caption lookup failed for '{title}': {e}")
-        return ""
-    info = info_cache.get(key)
-    if not info:
-        return ""
+        print(f"poster OCR crashed: {type(e).__name__}: {e}")
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def guess_ext(media) -> str:
+    mt = (getattr(media, "mime_type", None) or "").lower()
+    known = {"video/x-matroska": ".mkv", "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov",
+             "video/x-msvideo": ".avi", "audio/mpeg": ".mp3", "audio/mp4": ".m4a"}
+    return known.get(mt) or mimetypes.guess_extension(mt) or ".mp4"
+
+
+def build_filename(info: dict, media, old=None) -> str:
+    """TMDB ke title+saal se file ka naam, jaise 'Jawan (2023).mkv'."""
+    title = re.sub(r'[\\/:*?"<>|]+', " ", info["title"])
+    title = re.sub(r"\s{2,}", " ", title).strip()[:120] or "video"
+    year = f" ({info['year']})" if info.get("year") else ""
+    ext = ""
+    if old:
+        m = MEDIA_EXT_RE.search(old)
+        ext = m.group(0).lower() if m else ""
+    return f"{title}{year}{ext or guess_ext(media)}"
+
+
+def caption_from_info(info: dict, fname: str = "") -> str:
+    """Caption khaali ho to TMDB info se title/saal/rating/genre/story likho."""
     head = f"🎬 {info['title']}" + (f" ({info['year']})" if info["year"] else "")
     lines = [head]
     meta = []
@@ -405,7 +730,7 @@ async def auto_caption(msg: Message) -> str:
     if meta:
         lines.append(" · ".join(meta))
     quality = []
-    for q in QUALITY_INFO_RE.findall(fname):
+    for q in QUALITY_INFO_RE.findall(fname or ""):
         if q.lower() not in [x.lower() for x in quality]:
             quality.append(q)
     if quality:
@@ -515,7 +840,7 @@ FILE_ATTRS = ("document", "video", "audio", "photo", "voice", "animation", "vide
 
 def Job(**kw):
     base = dict(kind="skip", text=None, caption=None, msg_id=None, key=None, path=None,
-                thumb=None, name=None, tmp=None, send_as="document", meta=dict())
+                thumb=None, name=None, tmp=None, send_as="document", meta=dict(), info=None)
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -547,7 +872,7 @@ def with_footer(text: str, limit: int = 1024) -> str:
     return text[:limit]
 
 
-def copy_job(msg: Message, key, generated: str = "") -> SimpleNamespace:
+def copy_job(msg: Message, key, generated: str = "", info=None) -> SimpleNamespace:
     """File re-upload ke bina: Telegram server-side copy (fast). Sirf caption badalta hai."""
     captionable = bool(msg.photo or msg.document or msg.video or msg.audio or msg.animation or msg.voice)
     caption = None
@@ -555,7 +880,7 @@ def copy_job(msg: Message, key, generated: str = "") -> SimpleNamespace:
         caption = with_footer(generated)          # khud likha caption (original me caption tha hi nahi)
     elif captionable and (cfg["clean_caption"] or state["footer"]):
         caption = build_caption(msg.caption or "")
-    return Job(kind="copy", msg_id=msg.id, caption=caption, key=key)
+    return Job(kind="copy", msg_id=msg.id, caption=caption, key=key, info=info)
 
 
 async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool = None,
@@ -584,34 +909,53 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
     is_video = bool(msg.video) or (bool(msg.document) and (msg.document.mime_type or "").startswith("video/"))
     wants_poster = cfg["set_poster"] and is_video and bool(TMDB_API_KEY)
     wants_rename = cfg["clean_filename"] and bool(media)
+    need_caption = bool(media) and cfg["auto_caption"] and bool(TMDB_API_KEY) and not (msg.caption or "").strip()
+    wants_ocr = bool(media) and is_video and cfg["name_from_poster"] and bool(TMDB_API_KEY)
 
-    # caption bilkul nahi hai => TMDB se khud likho
-    generated = ""
-    if media and not (msg.caption or "").strip():
-        generated = await auto_caption(msg)
-
-    if not media or not (wants_rename or wants_poster):
-        return copy_job(msg, key, generated)
-
-    old = media.file_name
-    new = clean_filename(old) if (cfg["clean_filename"] and old) else old
+    old = media.file_name if media else None
+    clean_old = clean_filename(old) if old else None          # block words/@username hata kar (TMDB search saaf rahe)
     raw_caption = (msg.caption or "").strip()
-    first_line = raw_caption.splitlines()[0] if raw_caption else ""
-    title_src = new or first_line     # poster search ke liye naam (naam na ho to caption ki pehli line)
+    first_line = clean_text(raw_caption.splitlines()[0]) if raw_caption else ""
+    file_name_missing = not usable_title(clean_old)                       # file ka apna naam nahi / generic hai
+    name_missing = file_name_missing and not usable_title(first_line)     # caption se bhi naam nahi nikalta
+
+    # Pehchan: pehle file ka naam / caption se. Na mile (ya video me naam hi nahi) to video ke poster
+    # (thumbnail) pe likha naam OCR se padho, phir TMDB me confirm karke naam + poster + caption lagao.
+    info, from_poster_name = None, False
+    if media and TMDB_API_KEY and (need_caption or wants_poster or (wants_ocr and file_name_missing)):
+        info = await identify_from_text([clean_old, first_line])
+        if info is None and wants_ocr and (name_missing or wants_poster or need_caption):
+            info = await identify_from_thumb(client, media)
+        # file ka naam nahi tha => TMDB title+saal se naam do (caption se mila ho ya poster se)
+        from_poster_name = bool(info) and file_name_missing and wants_ocr
+
+    generated = caption_from_info(info, old or "") if (need_caption and info) else ""
+
+    if not media or not (wants_rename or wants_poster or from_poster_name):
+        return copy_job(msg, key, generated, info if is_video else None)
+
+    if from_poster_name:
+        new = build_filename(info, media, old)                 # naam tha hi nahi => poster wala naam save karo
+    elif cfg["clean_filename"] and old:
+        new = clean_old
+    else:
+        new = old
+    title_src = new or (info["title"] if info else "") or first_line or "file"
 
     tmp = tempfile.mkdtemp()
     try:
         poster = os.path.join(tmp, "poster.jpg")
-        has_poster = bool(wants_poster and title_src and await fetch_poster(title_src, poster))
+        has_poster = bool(wants_poster and info and await save_poster(
+            info, poster, (getattr(media, "width", 0) or 0, getattr(media, "height", 0) or 0)))
 
         # naam pehle se saaf hai aur naya poster nahi => re-upload ki zarurat nahi
         if new == old and not has_poster:
             shutil.rmtree(tmp, ignore_errors=True)
-            return copy_job(msg, key, generated)
+            return copy_job(msg, key, generated, info if is_video else None)
 
         dl_name = os.path.join(tmp, local_name(new)) if new else tmp + os.sep
         path = await safe(client.download_media, msg, file_name=dl_name,
-                          progress=make_progress("dl", title_src or "file"))
+                          progress=make_progress("dl", title_src))
         running["io"]["dl"] = ""
         if not path:
             raise RuntimeError("download_media ne koi file nahi di")
@@ -626,6 +970,7 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
                                    file_name=os.path.join(tmp, "thumb.jpg"))
 
         job = Job(kind="upload", path=path, thumb=thumb, name=new, tmp=tmp, key=key,
+                  info=info if is_video else None,
                   caption=with_footer(generated) if generated
                   else build_caption(msg.caption or "") if (cfg["clean_caption"] or state["footer"])
                   else (msg.caption or ""))
@@ -653,10 +998,37 @@ def mark_seen(key):
         dirty[0] += 1
 
 
+async def send_hd_poster(client: Client, target: int, info: dict):
+    """TMDB ka bada poster photo ki tarah (har title ke liye har destination me sirf ek baar)."""
+    pkey = f"hd:{target}:{info['poster_path']}"
+    if pkey in seen:
+        return
+    raw = await tmdb_poster_raw(info["poster_path"], "w780")
+    bio = BytesIO(raw)
+    bio.name = "poster.jpg"
+    meta = []
+    if info.get("rating"):
+        meta.append(f"⭐ {info['rating']:.1f}/10")
+    if info.get("genres"):
+        meta.append(", ".join(info["genres"]))
+    cap = f"🎬 {info['title']}" + (f" ({info['year']})" if info.get("year") else "")
+    if meta:
+        cap += "\n" + " · ".join(meta)
+    await throttle()
+    await safe(client.send_photo, target, bio, caption=cap[:1024], parse_mode=ParseMode.DISABLED)
+    seen.add(pkey)
+    dirty[0] += 1
+
+
 async def deliver(client: Client, job, target: int) -> str:
     k = job.kind
     if k in ("skip", "dup"):
         return k
+    if k in ("copy", "upload") and cfg["hd_poster"] and getattr(job, "info", None) and job.info.get("poster_path"):
+        try:
+            await send_hd_poster(client, target, job.info)
+        except Exception as e:                # poster fail hone se video na ruke
+            print(f"HD poster send failed: {type(e).__name__}: {e}")
     await throttle()
     if k == "text":
         await safe(client.send_message, target, job.text, parse_mode=ParseMode.DISABLED)
@@ -795,6 +1167,29 @@ def do_stop() -> bool:
     return True
 
 
+async def fetch_chunk(client: Client, chunk):
+    """get_messages network/server error par poora job gira dene ke bajay retry karo."""
+    for attempt in range(1, 6):
+        try:
+            return await safe(client.get_messages, SOURCE, chunk)
+        except Exception as e:
+            if attempt >= 5:
+                raise
+            wait = min(5 * attempt, 30)
+            print(f"get_messages fail ({type(e).__name__}: {e}) - {wait}s baad retry {attempt}/5")
+            await asyncio.sleep(wait)
+
+
+class ChatShim:
+    """Auto-resume ke liye: run_job ko Message jaisa object chahiye (reply_text + chat.id)."""
+    def __init__(self, client: Client, chat_id: int):
+        self._client = client
+        self.chat = SimpleNamespace(id=chat_id)
+
+    async def reply_text(self, text, **kw):
+        return await self._client.send_message(self.chat.id, text, **kw)
+
+
 async def run_job(client: Client, m: Message, ids, kind: str = "range", target: int = None, dedupe: bool = None,
                   media_only: bool = False):
     """ids: range ya list of message IDs. kind: 'range' (checkpoint banta hai) ya 'retry'."""
@@ -892,7 +1287,7 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
     try:
         for i in range(0, len(ids), 100):
             chunk = list(ids[i:i + 100])
-            msgs = await safe(client.get_messages, SOURCE, chunk)
+            msgs = await fetch_chunk(client, chunk)
             for mid, msg in zip(chunk, msgs):
                 await gate.wait()                       # pause
                 if running["stop"]:
@@ -913,6 +1308,9 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
             await safe_edit(status, render_panel("✅ <b>Forwarding complete</b>"))
     except StopRequested:
         outcome = "stopped"
+        if kind == "range" and state["last_job"]:
+            # user ne /stop kiya => restart pe auto-resume nahi; bot band hone (SIGTERM) pe roka gaya => auto-resume
+            state["last_job"]["user_stopped"] = not running.get("shutdown")
         if LIVE_PANEL:
             await safe_edit(status, render_panel("⛔ <b>Forwarding roki gayi</b>", resume_hint))
     except Exception as e:
@@ -931,6 +1329,8 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
         pending.clear()
         if kind == "range" and state["last_job"]:
             state["last_job"]["done"] = (outcome == "done")
+        if js.done > 0:
+            state["resume_tries"] = 0     # progress hua => auto-resume ka counter reset
         state["failed"] = sorted((set(state["failed"]) - js.processed) | set(js.failed_ids))
         save_state()
         summary = (f"{outcome.upper()} — sent {js.sent}, dup {js.dup}, skipped {js.skipped}, failed {js.failed}")
@@ -957,6 +1357,39 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
                 await safe(client.send_document, m.chat.id, f, caption="Failed message IDs")
         except Exception as e:
             print(f"notify failed: {e}")
+
+    if outcome == "error" and kind == "range" and AUTO_RESUME:
+        asyncio.create_task(auto_resume(30, "error"))
+
+
+async def auto_resume(delay: float, reason: str):
+    """Restart ya error ke baad adhura kaam khud wahin se aage badhao (user ne /stop kiya ho to nahi)."""
+    await asyncio.sleep(delay)
+    if running["busy"] or not AUTO_RESUME or not ADMINS:
+        return
+    lj = state["last_job"]
+    if not lj or lj.get("done") or lj["last_id"] >= lj["end"] or lj.get("user_stopped"):
+        return
+    tries = state.get("resume_tries", 0)
+    if tries >= MAX_AUTO_RESUMES:
+        print(f"auto-resume limit ({MAX_AUTO_RESUMES}) pahunch gaya, ruk raha hu")
+        for admin in ADMINS:
+            try:
+                await app.send_message(admin, f"⚠️ Auto-resume {MAX_AUTO_RESUMES} baar try ho chuka, har baar error aaya.\n"
+                                              "Logs check karo, phir /resume se manually chalao.")
+            except Exception as e:
+                print(f"auto-resume notify failed for {admin}: {e}")
+        return
+    state["resume_tries"] = tries + 1
+    save_state()
+    target = lj.get("target") or default_target()
+    res = await resolve_channels(target)
+    if any(res.values()):
+        print(f"auto-resume: channel access nahi mila: {res}")
+        return
+    print(f"auto-resume ({reason}): ID {lj['last_id'] + 1} -> {lj['end']} (try {tries + 1}/{MAX_AUTO_RESUMES})")
+    await start_range_job(app, ChatShim(app, ADMINS[0]), lj["last_id"] + 1, lj["end"], target,
+                          lj.get("dedupe"), lj.get("media_only", False))
 
 
 async def start_range_job(client: Client, m: Message, start_id: int, end_id: int,
@@ -987,6 +1420,7 @@ USAGE = (
     "▫️ <code>/settings</code> — features on/off (buttons)\n"
     "▫️ <code>/addblock word</code> · <code>/delblock word</code> · <code>/blocklist</code>\n"
     "▫️ <code>/footer text</code> — har caption ke neeche text (<code>/footer off</code>)\n"
+    "▫️ <code>/poster Jawan 2023</code> — TMDB test · kisi video pe reply karke <code>/poster</code> — poster se naam padhna test\n"
     "▫️ <code>/stats</code> · <code>/resetseen</code>\n\n"
     "<i>Saari files ke liye bot ko source channel me admin + Post Messages permission chahiye.</i>"
 )
@@ -1092,6 +1526,7 @@ async def clean_cmd(client: Client, m: Message):
                 "Bot ko source channel me admin + 'Post Messages' permission do.\n"
                 f"Error: {type(e).__name__}: {e}"
             )
+    state["resume_tries"] = 0
     await start_range_job(client, m, start_id, end_id, target, dedupe, media_only)
 
 
@@ -1106,6 +1541,7 @@ async def resume_cmd(client: Client, m: Message):
     res = await resolve_channels(target)
     if any(res.values()):
         return await m.reply_text("Channel access nahi mil raha. Bot dono channels me admin hai ya nahi check karo.")
+    state["resume_tries"] = 0
     await start_range_job(client, m, lj["last_id"] + 1, lj["end"], target, lj.get("dedupe"), lj.get("media_only", False))
 
 
@@ -1188,6 +1624,56 @@ async def job_cb(_, cq: CallbackQuery):
                         job_buttons(bool(js.pause_since)))
 
 
+@app.on_message(filters.command("poster") & filters.private & admin_filter)
+async def poster_cmd(client: Client, m: Message):
+    """Test: /poster Jawan 2023   ya   kisi video pe reply karke /poster"""
+    if not TMDB_API_KEY:
+        return await m.reply_text("❌ TMDB_API_KEY set nahi hai (themoviedb.org se free key lo).")
+    rep_msg = m.reply_to_message
+    media = rep_msg and (rep_msg.video or rep_msg.document or rep_msg.audio)
+    arg = _arg_text(m)
+    if not media and not arg:
+        return await m.reply_text("Use: <code>/poster Jawan 2023</code>  ya kisi video pe reply karke <code>/poster</code>",
+                                  parse_mode=ParseMode.HTML)
+    notes, info = [], None
+    try:
+        if media:
+            old = media.file_name
+            cap_line = (rep_msg.caption or "").strip().splitlines()[:1]
+            notes.append(f"File naam: {old or '—'}")
+            info = await identify_from_text([clean_filename(old) if old else None,
+                                             clean_text(cap_line[0]) if cap_line else ""])
+            if info:
+                notes.append("Match: file naam / caption se")
+            else:
+                dbg = {}
+                info = await identify_from_thumb(client, media, dbg)
+                lines = ", ".join(t for t, _ in dbg.get("lines", [])[:8]) or "— (kuch nahi padha)"
+                notes.append(f"OCR ({ocr_status()}) ne padha: {lines}")
+                notes.append(f"Candidates: {', '.join(dbg.get('cands', [])) or '—'}")
+                if not getattr(media, "thumbs", None):
+                    notes.append("⚠️ Is video me thumbnail (poster) hi nahi hai")
+                if info:
+                    notes.append("Match: poster ke text (OCR) se")
+        else:
+            title, year = guess_title(arg)
+            notes.append(f"Search: {title} {year or ''}")
+            info = await tmdb_lookup(title, year, arg)
+    except Exception as e:
+        return await m.reply_text(f"❌ Error: <code>{html.escape(type(e).__name__ + ': ' + str(e))}</code>",
+                                  parse_mode=ParseMode.HTML)
+    body = "\n".join(html.escape(n) for n in notes)
+    if not info:
+        return await m.reply_text(f"😕 TMDB me match nahi mila.\n\n{body}", parse_mode=ParseMode.HTML)
+    caption = (f"✅ <b>{html.escape(info['title'])}</b> ({info['year'] or '?'}) · match {info['score']:.0%}\n\n{body}")[:1024]
+    try:
+        bio = BytesIO(await tmdb_poster_by_path(info["poster_path"]))
+        bio.name = "poster.jpg"
+        await m.reply_photo(bio, caption=caption, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await m.reply_text(f"{caption}\n\n⚠️ Poster download fail: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+
+
 # ---------- settings ----------
 def settings_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -1204,7 +1690,8 @@ def settings_text() -> str:
         "Button dabake on/off karo (turant lagu, restart ke baad bhi yaad rehta hai).\n\n"
         f"📝 Footer: <code>{footer}</code>\n"
         f"🚫 Block words: <code>{words}</code>\n"
-        f"🖼 TMDB key: <code>{'set' if TMDB_API_KEY else 'NOT SET (poster nahi lagega)'}</code>"
+        f"🖼 TMDB key: <code>{'set' if TMDB_API_KEY else 'NOT SET (poster nahi lagega)'}</code>\n"
+        f"🔎 Poster OCR: <code>{ocr_status()}</code>"
     )
 
 
@@ -1289,10 +1776,20 @@ async def resetseen_cmd(_, m: Message):
 
 
 # ---------- new posts in the source channel get cleaned and shared automatically ----------
+# Pehle har post ka kaam seedha Pyrogram ke handler worker me chalta tha: bahut saari/badi files aane par saare
+# workers busy ho jate the aur bot "ruk gaya" lagta tha (commands tak jawab nahi dete). Ab handler sirf queue me
+# daalta hai, ek alag worker ek-ek karke (order me) bhejta hai.
+auto_queue = None
+
+
 @app.on_message(filters.chat(SOURCE) & (filters.document | filters.video | filters.audio | filters.photo))
 async def auto(client: Client, m: Message):
-    if not cfg["auto"]:
+    if not cfg["auto"] or auto_queue is None:
         return
+    auto_queue.put_nowait(m)
+
+
+async def process_auto(client: Client, m: Message):
     try:
         target, delete_source = destination_for(m, default_target())
         res = await handle(client, prepare(client, m, target), target)
@@ -1303,7 +1800,23 @@ async def auto(client: Client, m: Message):
         maybe_save()
     except Exception as e:
         bump("failed")
-        print(f"auto msg {m.id} failed: {e}")
+        state["failed"] = sorted(set(state["failed"]) | {m.id})    # /retryfailed se dobara ho sakta hai
+        dirty[0] += 1
+        maybe_save(True)
+        print(f"auto msg {m.id} failed: {type(e).__name__}: {e}")
+
+
+async def auto_worker():
+    while True:
+        m = await auto_queue.get()
+        try:
+            await process_auto(app, m)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:      # worker kabhi marna nahi chahiye
+            print(f"auto worker error: {type(e).__name__}: {e}")
+        finally:
+            auto_queue.task_done()
 
 
 # ======================================================================
@@ -1330,8 +1843,10 @@ async def keep_alive():
 
 
 async def main():
+    global auto_queue
     load_state()
     rebuild_block_re()
+    auto_queue = asyncio.Queue()
 
     server = web.Application()
     server.add_routes([web.get("/", health)])
@@ -1341,19 +1856,24 @@ async def main():
     await app.start()
     await resolve_channels()    # peer cache (Peer id invalid fix)
     ka_task = asyncio.create_task(keep_alive())
+    aw_task = asyncio.create_task(auto_worker())
 
-    # pichla kaam adhura reh gaya tha (restart/redeploy) => admins ko ek baar batao
+    # pichla kaam adhura reh gaya tha (restart/redeploy/crash)
     lj = state["last_job"]
-    if lj and not lj.get("done") and lj["last_id"] < lj["end"] and not lj.get("announced"):
-        lj["announced"] = True
-        save_state()
-        for admin in ADMINS:
-            try:
-                await app.send_message(
-                    admin, f"🟢 Bot online. Pichla kaam adhura tha (ID {lj['last_id'] + 1} → {lj['end']}).\n"
-                           "▶️ /resume se wahin se aage badhao.")
-            except Exception as e:
-                print(f"startup notify failed for {admin}: {e}")
+    if lj and not lj.get("done") and lj["last_id"] < lj["end"]:
+        if AUTO_RESUME and ADMINS and not lj.get("user_stopped"):
+            print(f"pichla kaam adhura tha (ID {lj['last_id'] + 1} -> {lj['end']}): auto-resume hoga")
+            asyncio.create_task(auto_resume(5, "startup"))
+        elif not lj.get("announced"):
+            lj["announced"] = True
+            save_state()
+            for admin in ADMINS:
+                try:
+                    await app.send_message(
+                        admin, f"🟢 Bot online. Pichla kaam adhura tha (ID {lj['last_id'] + 1} → {lj['end']}).\n"
+                               "▶️ /resume se wahin se aage badhao.")
+                except Exception as e:
+                    print(f"startup notify failed for {admin}: {e}")
 
     print("Bot started")
 
@@ -1367,6 +1887,7 @@ async def main():
     await stop_evt.wait()
 
     print("Shutting down...")
+    running["shutdown"] = True      # restart ke baad auto-resume ho sake (ye user ka /stop nahi hai)
     if running["busy"]:
         do_stop()
         for _ in range(50):    # max ~25s current file khatam hone ka wait
@@ -1374,6 +1895,7 @@ async def main():
                 break
             await asyncio.sleep(0.5)
     ka_task.cancel()
+    aw_task.cancel()
     save_state()
     await app.stop()
     await runner.cleanup()
