@@ -3,4 +3,4 @@ pyrofork
 tgcrypto
 aiohttp
 Pillow
- 
+pytesseract
