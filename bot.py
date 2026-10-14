@@ -57,19 +57,21 @@ TMDB_IMG = os.environ.get("TMDB_IMAGE_BASE", "https://image.tmdb.org/t/p").rstri
 OCR_SPACE_KEY = os.environ.get("OCR_SPACE_KEY", "").strip()  # free key ocr.space se (jahan tesseract install nahi hota)
 OCR_MIN_SCORE = float(os.environ.get("OCR_MIN_SCORE", "0.8"))   # poster se padhe naam ka TMDB match kitna strict ho
 AUTO_RESUME = env_bool("AUTO_RESUME", True)                   # restart/error ke baad adhura kaam khud resume
-MAX_AUTO_RESUMES = max(1, int(os.environ.get("MAX_AUTO_RESUMES", "5")))   # bina progress ke max kitni baar khud resume
+MAX_AUTO_RESUMES = max(0, int(os.environ.get("MAX_AUTO_RESUMES", "0")))   # bina progress ke max kitni baar khud resume (0 = jab tak kaam poora na ho)
+RETRY_ROUNDS = max(0, int(os.environ.get("RETRY_ROUNDS", "4")))             # job ke end me failed files itni baar khud dobara bhejo
 BLOCK_WORDS = [w.strip() for w in os.environ.get("BLOCK_WORDS", "").split(",") if w.strip()]
 PORT = int(os.environ.get("PORT", "8080"))                   # Render health-check port
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()   # Render sets this itself (keep-alive ping)
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")      # progress + settings yahan save hote hain
-TRANSMISSIONS = int(os.environ.get("TRANSMISSIONS", "4"))        # parallel upload/download streams
+TRANSMISSIONS = int(os.environ.get("TRANSMISSIONS", "8"))        # parallel upload/download streams
 PREFETCH = max(1, int(os.environ.get("PREFETCH", "3")))          # kitni files aage se download/prepare hon
 LIVE_PANEL = env_bool("LIVE_PANEL", False)                              # True => job ke dauran live progress panel dikhao
+FRAME_AT = min(max(float(os.environ.get("FRAME_AT", "0.1")), 0.0), 0.95)   # video ke kitne hisse par frame (0.1 = 10%)
 MAX_RETRIES = max(1, int(os.environ.get("MAX_RETRIES", "3")))    # network error pe kitni baar retry
 
 # Telegram guideline: ek chat me ~1 message/second se zyada nahi. Isliye delay 1s se kam allowed nahi.
-MIN_DELAY = 1.0
-SEND_DELAY = max(float(os.environ.get("SEND_DELAY", "1.0")), MIN_DELAY)
+MIN_DELAY = 0.5      # FloodWait aaye to delay khud badh jata hai (safe() dekho), isliye thoda tez rakha
+SEND_DELAY = max(float(os.environ.get("SEND_DELAY", "0.7")), MIN_DELAY)
 # Live rate-limit state: FloodWait aane par delay khud badhta hai, phir dheere dheere wapas kam hota hai
 # FloodWait ke baad delay max itna hi badhega (Telegram ~20 msg/min => ~3s/msg safe hai). Pehle 10s tak jata tha => bahut slow.
 FLOOD_MAX_DELAY = max(float(os.environ.get("FLOOD_MAX_DELAY", "3.0")), SEND_DELAY)
@@ -87,6 +89,7 @@ cfg = {
     "auto_caption": env_bool("AUTO_CAPTION", True),      # caption khaali ho to TMDB se khud likho (TMDB_API_KEY chahiye)
     "hd_poster": env_bool("HD_POSTER", False),           # movie ke saath TMDB ka bada (HD) poster alag photo me bhi bhejo
     "name_from_poster": env_bool("NAME_FROM_POSTER", True),  # video me naam na ho to poster (thumbnail) se naam padho (OCR)
+    "frame_thumb": env_bool("FRAME_THUMB", True),        # video ka apna frame thumbnail/cover bane (ffmpeg chahiye)
 }
 SETTING_LABELS = {
     "clean_caption": "🧹 Clean caption",
@@ -99,6 +102,7 @@ SETTING_LABELS = {
     "auto_caption": "📝 Auto caption (jahan caption nahi)",
     "hd_poster": "🖼 HD poster photo (video ke upar alag)",
     "name_from_poster": "🔎 Poster se naam padho (naam na ho to)",
+    "frame_thumb": "🎞 Video frame thumbnail",
 }
 
 app = Client("cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
@@ -496,6 +500,42 @@ def make_thumb(raw: bytes, vw: int = 0, vh: int = 0) -> bytes:
     fg = poster.resize((fg_w, fg_h), Image.LANCZOS)    # poster poora dikhe (title kate nahi)
     bg.paste(fg, ((cw - fg_w) // 2, (ch - fg_h) // 2))
     return _jpeg_under_limit(bg)
+
+
+async def extract_frame(video_path: str, dest: str, duration: int = 0, vw: int = 0, vh: int = 0) -> bool:
+    """Video ke andar se ek frame nikalo (ffmpeg) -> Telegram thumbnail (JPEG, max 320px, <200KB)."""
+    if not shutil.which("ffmpeg"):
+        return False
+    ts = 1.0 if not duration else min(max(duration * FRAME_AT, 1.0), max(duration - 1, 0.0))
+    raw = dest + ".raw.jpg"
+    try:
+        for t in (ts, 0.0):      # frame na mile (chhota video) to shuru ka frame
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", video_path, "-frames:v", "1",
+                "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-q:v", "3", raw,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            try:
+                await asyncio.wait_for(proc.wait(), 60)
+            except asyncio.TimeoutError:
+                proc.kill()
+                continue
+            if os.path.exists(raw) and os.path.getsize(raw) > 0:
+                break
+        else:
+            return False
+        with open(raw, "rb") as f:
+            data = _jpeg_under_limit(Image.open(BytesIO(f.read())).convert("RGB"))
+        with open(dest, "wb") as f:
+            f.write(data)
+        return True
+    except Exception as e:
+        print(f"frame thumbnail failed: {type(e).__name__}: {e}")
+        return False
+    finally:
+        try:
+            os.remove(raw)
+        except OSError:
+            pass
 
 
 async def tmdb_poster_by_path(poster_path: str, size=(0, 0)) -> bytes:
@@ -911,6 +951,7 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
     wants_rename = cfg["clean_filename"] and bool(media)
     need_caption = bool(media) and cfg["auto_caption"] and bool(TMDB_API_KEY) and not (msg.caption or "").strip()
     wants_ocr = bool(media) and is_video and cfg["name_from_poster"] and bool(TMDB_API_KEY)
+    wants_frame = bool(media) and is_video and cfg["frame_thumb"] and bool(shutil.which("ffmpeg"))
 
     old = media.file_name if media else None
     clean_old = clean_filename(old) if old else None          # block words/@username hata kar (TMDB search saaf rahe)
@@ -931,7 +972,7 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
 
     generated = caption_from_info(info, old or "") if (need_caption and info) else ""
 
-    if not media or not (wants_rename or wants_poster or from_poster_name):
+    if not media or not (wants_rename or wants_poster or from_poster_name or wants_frame):
         return copy_job(msg, key, generated, info if is_video else None)
 
     if from_poster_name:
@@ -945,11 +986,11 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
     tmp = tempfile.mkdtemp()
     try:
         poster = os.path.join(tmp, "poster.jpg")
-        has_poster = bool(wants_poster and info and await save_poster(
+        has_poster = bool(wants_poster and not wants_frame and info and await save_poster(
             info, poster, (getattr(media, "width", 0) or 0, getattr(media, "height", 0) or 0)))
 
         # naam pehle se saaf hai aur naya poster nahi => re-upload ki zarurat nahi
-        if new == old and not has_poster:
+        if new == old and not has_poster and not wants_frame:
             shutil.rmtree(tmp, ignore_errors=True)
             return copy_job(msg, key, generated, info if is_video else None)
 
@@ -961,7 +1002,11 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
             raise RuntimeError("download_media ne koi file nahi di")
 
         thumb = None
-        if has_poster:
+        frame = os.path.join(tmp, "frame.jpg")
+        if wants_frame and await extract_frame(path, frame, getattr(media, "duration", 0) or 0,
+                                               getattr(media, "width", 0) or 0, getattr(media, "height", 0) or 0):
+            thumb = frame
+        elif has_poster:
             thumb = poster
         else:
             thumbs = getattr(media, "thumbs", None)
@@ -1169,14 +1214,14 @@ def do_stop() -> bool:
 
 async def fetch_chunk(client: Client, chunk):
     """get_messages network/server error par poora job gira dene ke bajay retry karo."""
-    for attempt in range(1, 6):
+    for attempt in range(1, 21):
         try:
             return await safe(client.get_messages, SOURCE, chunk)
         except Exception as e:
-            if attempt >= 5:
+            if attempt >= 20:
                 raise
-            wait = min(5 * attempt, 30)
-            print(f"get_messages fail ({type(e).__name__}: {e}) - {wait}s baad retry {attempt}/5")
+            wait = min(5 * attempt, 60)
+            print(f"get_messages fail ({type(e).__name__}: {e}) - {wait}s baad retry {attempt}/20")
             await asyncio.sleep(wait)
 
 
@@ -1262,14 +1307,14 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
             js.failed_ids.append(mid)
         bump(res)
         js.done += 1
-        js.last_id = mid
+        js.last_id = max(js.last_id, mid)
         js.processed.add(mid)
         tick_now = time.monotonic()
         dt = tick_now - js.last_tick
         js.last_tick = tick_now
         js.ewma = dt if not js.ewma else js.ewma * 0.9 + dt * 0.1
         if kind == "range" and state["last_job"]:
-            state["last_job"]["last_id"] = mid
+            state["last_job"]["last_id"] = max(state["last_job"]["last_id"], mid)
         dirty[0] += 1
         maybe_save()
 
@@ -1304,6 +1349,27 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
                 raise StopRequested
             await consume(pending.popleft())
             await tick()
+        # jo files fail hui thi unhe khud dobara bhejo (kuch der ruk kar), taaki sab share hone ke baad hi job khatam ho
+        for rnd in range(1, RETRY_ROUNDS + 1):
+            if not js.failed_ids:
+                break
+            retry_ids = list(js.failed_ids)
+            print(f"auto-retry round {rnd}/{RETRY_ROUNDS}: {len(retry_ids)} failed files")
+            js.failed_ids.clear()
+            js.failed -= len(retry_ids)
+            js.done -= len(retry_ids)
+            await asyncio.sleep(min(15 * rnd, 60))
+            for i in range(0, len(retry_ids), 100):
+                chunk = retry_ids[i:i + 100]
+                msgs = await fetch_chunk(client, chunk)
+                for mid, msg in zip(chunk, msgs):
+                    await gate.wait()
+                    if running["stop"]:
+                        raise StopRequested
+                    item_target, delete_source = destination_for(msg, target)
+                    await consume((mid, asyncio.create_task(prepare(client, msg, item_target, dedupe, media_only)),
+                                   item_target, delete_source))
+                    await tick()
         if LIVE_PANEL:
             await safe_edit(status, render_panel("✅ <b>Forwarding complete</b>"))
     except StopRequested:
@@ -1365,21 +1431,33 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
 async def auto_resume(delay: float, reason: str):
     """Restart ya error ke baad adhura kaam khud wahin se aage badhao (user ne /stop kiya ho to nahi)."""
     await asyncio.sleep(delay)
-    if running["busy"] or not AUTO_RESUME or not ADMINS:
+    if running["busy"] or running.get("resuming") or not AUTO_RESUME or not ADMINS:
         return
+    running["resuming"] = True      # error-path aur watchdog dono ek saath job shuru na karein
+    try:
+        await _auto_resume(reason)
+    finally:
+        running["resuming"] = False
+
+
+async def _auto_resume(reason: str):
     lj = state["last_job"]
     if not lj or lj.get("done") or lj["last_id"] >= lj["end"] or lj.get("user_stopped"):
         return
     tries = state.get("resume_tries", 0)
-    if tries >= MAX_AUTO_RESUMES:
-        print(f"auto-resume limit ({MAX_AUTO_RESUMES}) pahunch gaya, ruk raha hu")
-        for admin in ADMINS:
-            try:
-                await app.send_message(admin, f"⚠️ Auto-resume {MAX_AUTO_RESUMES} baar try ho chuka, har baar error aaya.\n"
-                                              "Logs check karo, phir /resume se manually chalao.")
-            except Exception as e:
-                print(f"auto-resume notify failed for {admin}: {e}")
+    if MAX_AUTO_RESUMES and tries >= MAX_AUTO_RESUMES:
+        if not state.get("resume_limit_notified"):
+            state["resume_limit_notified"] = True
+            save_state()
+            print(f"auto-resume limit ({MAX_AUTO_RESUMES}) pahunch gaya, ruk raha hu")
+            for admin in ADMINS:
+                try:
+                    await app.send_message(admin, f"⚠️ Auto-resume {MAX_AUTO_RESUMES} baar try ho chuka, har baar error aaya.\n"
+                                                  "Logs check karo, phir /resume se manually chalao.")
+                except Exception as e:
+                    print(f"auto-resume notify failed for {admin}: {e}")
         return
+    state["resume_limit_notified"] = False
     state["resume_tries"] = tries + 1
     save_state()
     target = lj.get("target") or default_target()
@@ -1387,9 +1465,27 @@ async def auto_resume(delay: float, reason: str):
     if any(res.values()):
         print(f"auto-resume: channel access nahi mila: {res}")
         return
-    print(f"auto-resume ({reason}): ID {lj['last_id'] + 1} -> {lj['end']} (try {tries + 1}/{MAX_AUTO_RESUMES})")
-    await start_range_job(app, ChatShim(app, ADMINS[0]), lj["last_id"] + 1, lj["end"], target,
-                          lj.get("dedupe"), lj.get("media_only", False))
+    print(f"auto-resume ({reason}): ID {lj['last_id'] + 1} -> {lj['end']} (try {tries + 1})")
+    try:
+        await start_range_job(app, ChatShim(app, ADMINS[0]), lj["last_id"] + 1, lj["end"], target,
+                              lj.get("dedupe"), lj.get("media_only", False))
+    except Exception as e:      # job shuru hi na ho paye to bhi watchdog dobara koshish karega
+        print(f"auto-resume start failed: {type(e).__name__}: {e}")
+
+
+async def resume_watchdog():
+    """Har minute check: adhura kaam pada hai aur bot khali hai => khud aage badhao (user ka /stop chhodkar)."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            lj = state["last_job"]
+            if (AUTO_RESUME and ADMINS and not running["busy"] and lj and not lj.get("done")
+                    and lj["last_id"] < lj["end"] and not lj.get("user_stopped")):
+                await auto_resume(0, "watchdog")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"watchdog error: {type(e).__name__}: {e}")
 
 
 async def start_range_job(client: Client, m: Message, start_id: int, end_id: int,
@@ -1857,6 +1953,7 @@ async def main():
     await resolve_channels()    # peer cache (Peer id invalid fix)
     ka_task = asyncio.create_task(keep_alive())
     aw_task = asyncio.create_task(auto_worker())
+    wd_task = asyncio.create_task(resume_watchdog())
 
     # pichla kaam adhura reh gaya tha (restart/redeploy/crash)
     lj = state["last_job"]
@@ -1896,6 +1993,7 @@ async def main():
             await asyncio.sleep(0.5)
     ka_task.cancel()
     aw_task.cancel()
+    wd_task.cancel()
     save_state()
     await app.stop()
     await runner.cleanup()
