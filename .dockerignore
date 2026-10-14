@@ -1,0 +1,6 @@
+__pycache__/
+*.session
+*.session-journal
+bot_state.json
+.git
+.env

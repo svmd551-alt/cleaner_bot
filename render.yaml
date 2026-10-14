@@ -1,0 +1,36 @@
+services:
+  - type: web                 # web service chahiye kyunki bot health-check port kholta hai
+    name: cleaner-forwarder-bot
+    runtime: docker
+    plan: free                # paid plan lo to neeche wali disk wali lines khol do
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      # ---- zaroori (Render dashboard me value daalo) ----
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMINS             # tumhari Telegram user ID (kai ho to space/comma se alag)
+        sync: false
+      - key: SOURCE_CHANNEL     # -100... source/database channel
+        sync: false
+      - key: TARGET_CHANNEL     # -100... destination channel
+        sync: false
+      # ---- optional ----
+      - key: QUALITY_TARGET_CHANNEL
+        sync: false
+      - key: USER_SESSION       # Premium account session string (2GB-4GB files rename ke liye)
+        sync: false
+      - key: WORKERS
+        value: "3"
+      - key: SEND_DELAY
+        value: "0.5"
+    # Paid plan par progress/duplicate memory restart ke baad bhi bachane ke liye:
+    # disk:
+    #   name: botdata
+    #   mountPath: /data
+    #   sizeGB: 5
+    # aur envVars me:  - key: STATE_FILE   value: /data/bot_state.json
