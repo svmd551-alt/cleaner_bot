@@ -63,6 +63,7 @@ RETRY_ROUNDS = max(0, int(os.environ.get("RETRY_ROUNDS", "4")))             # jo
 BLOCK_WORDS = [w.strip() for w in os.environ.get("BLOCK_WORDS", "").split(",") if w.strip()]
 PORT = int(os.environ.get("PORT", "8080"))                   # Render health-check port
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()   # Render sets this itself (keep-alive ping)
+STARTUP_NOTIFY = env_bool("STARTUP_NOTIFY", True)                # har start/restart par admin ko message
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")      # progress + settings yahan save hote hain
 TRANSMISSIONS = int(os.environ.get("TRANSMISSIONS", "8"))        # parallel upload/download streams
 PREFETCH = max(1, int(os.environ.get("PREFETCH", "3")))          # kitni files aage se download/prepare hon
@@ -155,10 +156,15 @@ def seen_key(key, target: int):
     return key if target == TARGET else f"{target}:{key}"
 
 
+STATE_FOUND = False      # restart ke baad purani progress file mili ya nahi (Render free par disk nahi hoti)
+
+
 def load_state():
+    global STATE_FOUND
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
+        STATE_FOUND = True
     except FileNotFoundError:
         return
     except Exception as e:
@@ -1340,16 +1346,24 @@ def do_stop() -> bool:
 
 
 async def fetch_chunk(client: Client, chunk):
-    """get_messages network/server error par poora job gira dene ke bajay retry karo."""
-    for attempt in range(1, 21):
+    """Temporary Telegram/network errors par job ko terminate na hone do; retry until success or stop."""
+    attempt = 0
+    while not running.get("stop"):
+        attempt += 1
         try:
             return await safe(client.get_messages, SOURCE, chunk)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            if attempt >= 20:
-                raise
+            # Backoff capped at 60s. This prevents a single temporary outage from
+            # silently ending a long /sendall operation after the old 20-attempt limit.
             wait = min(5 * attempt, 60)
-            print(f"get_messages fail ({type(e).__name__}: {e}) - {wait}s baad retry {attempt}/20")
-            await asyncio.sleep(wait)
+            print(f"get_messages fail ({type(e).__name__}: {e}) - {wait}s baad retry (attempt {attempt})")
+            for _ in range(wait):
+                if running.get("stop"):
+                    raise StopRequested
+                await asyncio.sleep(1)
+    raise StopRequested
 
 
 class ChatShim:
@@ -1621,10 +1635,20 @@ async def run_job(client: Client, m, ids, kind: str = "range", target: int = Non
         raise
     except Exception as e:
         outcome = "error"
-        print(f"run_job crashed: {type(e).__name__}: {e}")
+        error_text = f"{type(e).__name__}: {e}"
+        print(f"run_job crashed: {error_text}")
         await safe_edit(status, render_panel(
-            "❌ <b>Error aa gaya</b>",
-            f"<code>{html.escape(type(e).__name__ + ': ' + str(e))}</code>\n{resume_hint}"))
+            "❌ <b>Forwarding error — job ruk gaya</b>",
+            f"<code>{html.escape(error_text[:700])}</code>\\n{resume_hint}"))
+        try:
+            await safe(client.send_message, m.chat.id,
+                       "⚠️ <b>Forwarding job error ki wajah se ruk gaya.</b>\\n"
+                       f"<code>{html.escape(error_text[:700])}</code>\\n"
+                       "Auto-resume enabled ho to bot dobara koshish karega. "
+                       "/status se check karein; zarurat par /resume chalayein.",
+                       parse_mode=ParseMode.HTML)
+        except Exception as notify_error:
+            print(f"job error notification failed: {type(notify_error).__name__}: {notify_error}")
     finally:
         if kind == "range" and state["last_job"]:
             state["last_job"]["done"] = (outcome == "done")
@@ -2278,6 +2302,25 @@ async def main():
                     print(f"startup notify failed for {admin}: {e}")
 
     print("Bot started")
+
+    # Har start par admin ko batao: pata chale ki bot restart hua tha aur progress bachi ya nahi
+    if STARTUP_NOTIFY:
+        lj = state["last_job"]
+        if lj and not lj.get("done") and lj["last_id"] < lj["end"]:
+            extra = (f"Pichla kaam ID <code>{lj['last_id'] + 1}</code> → <code>{lj['end']}</code> adhura tha"
+                     + (", khud resume ho raha hai." if (AUTO_RESUME and not lj.get("user_stopped"))
+                        else ". /resume se aage badhao."))
+        elif STATE_FOUND:
+            extra = "Koi adhura kaam nahi tha."
+        else:
+            extra = ("⚠️ <b>Purani progress file nahi mili</b> — Render par disk persist nahi hoti (ya pehli baar start hua). "
+                     "Agar koi kaam chal raha tha to wo <code>/sendall</code> se dobara shuru karo "
+                     "(jo files ja chuki hain wo channel me dikhti hain, par bot ko yaad nahi, isliye duplicate ja sakti hain).")
+        for admin in ADMINS:
+            try:
+                await app.send_message(admin, f"🟢 <b>Bot start/restart hua</b>\n{extra}", parse_mode=ParseMode.HTML)
+            except Exception as e:
+                print(f"startup notify failed for {admin}: {e}")
 
     stop_evt = asyncio.Event()
     loop = asyncio.get_running_loop()
