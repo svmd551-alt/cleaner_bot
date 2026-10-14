@@ -15,9 +15,10 @@ from types import SimpleNamespace
 
 # Python 3.12+/3.14 me pyrogram import hote hi event loop maangta hai - pehle se bana do
 try:
-    asyncio.get_event_loop()
+    LOOP = asyncio.get_event_loop()
 except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+    LOOP = asyncio.new_event_loop()
+    asyncio.set_event_loop(LOOP)
 
 import aiohttp
 from aiohttp import web
@@ -65,31 +66,40 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()   # Render sets t
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")      # progress + settings yahan save hote hain
 TRANSMISSIONS = int(os.environ.get("TRANSMISSIONS", "8"))        # parallel upload/download streams
 PREFETCH = max(1, int(os.environ.get("PREFETCH", "3")))          # kitni files aage se download/prepare hon
-LIVE_PANEL = env_bool("LIVE_PANEL", False)                              # True => job ke dauran live progress panel dikhao
+LIVE_PANEL = env_bool("LIVE_PANEL", True)                               # True => job ke dauran live progress panel dikhao
 FRAME_AT = min(max(float(os.environ.get("FRAME_AT", "0.1")), 0.0), 0.95)   # video ke kitne hisse par frame (0.1 = 10%)
 MAX_RETRIES = max(1, int(os.environ.get("MAX_RETRIES", "3")))    # network error pe kitni baar retry
+WORKERS = max(1, int(os.environ.get("WORKERS", "3")))            # kitni files ek saath (parallel) download/upload hon (1 = bilkul order me)
+QUEUE_SIZE = max(PREFETCH, WORKERS * 2)                          # workers ke liye aage se kitne messages tayyar rakhne hain
+SHUTDOWN_WAIT = max(5, int(os.environ.get("SHUTDOWN_WAIT", "20")))     # restart/redeploy pe current files ke liye max wait (sec)
+COOLDOWN_AFTER = max(3, int(os.environ.get("COOLDOWN_AFTER", "8")))    # lagataar itni files fail => kaam cancel nahi, thoda ruk kar dobara
+MAX_UPLOAD_BYTES = int(float(os.environ.get("MAX_UPLOAD_MB", "1990")) * 1024 * 1024)   # bot upload limit ~2GB
+USER_SESSION = os.environ.get("USER_SESSION", "").strip()        # Premium account ka Pyrogram session string (2GB-4GB files ke liye)
+USER_MAX_BYTES = int(float(os.environ.get("USER_MAX_MB", "3990")) * 1024 * 1024)   # Premium upload limit ~4GB
+SILENT = env_bool("SILENT", True)                                # True => target channel me bulk sending bina notification ke
+TG_WORKERS = max(4, int(os.environ.get("TG_WORKERS", "8")))      # Pyrogram ke handler workers
 
 # Telegram guideline: ek chat me ~1 message/second se zyada nahi. Isliye delay 1s se kam allowed nahi.
 MIN_DELAY = 0.5      # FloodWait aaye to delay khud badh jata hai (safe() dekho), isliye thoda tez rakha
-SEND_DELAY = max(float(os.environ.get("SEND_DELAY", "0.7")), MIN_DELAY)
+SEND_DELAY = max(float(os.environ.get("SEND_DELAY", "0.5")), MIN_DELAY)
 # Live rate-limit state: FloodWait aane par delay khud badhta hai, phir dheere dheere wapas kam hota hai
 # FloodWait ke baad delay max itna hi badhega (Telegram ~20 msg/min => ~3s/msg safe hai). Pehle 10s tak jata tha => bahut slow.
 FLOOD_MAX_DELAY = max(float(os.environ.get("FLOOD_MAX_DELAY", "3.0")), SEND_DELAY)
-rate = {"delay": SEND_DELAY, "floods": 0, "flood_secs": 0.0}
+rate = {"delay": SEND_DELAY, "floods": 0, "flood_secs": 0.0, "flood_until": 0.0}
 
 # Runtime settings (/settings se on/off). Env sirf starting default hai.
 cfg = {
     "clean_caption": env_bool("CLEAN_CAPTION", True),    # caption se @username / t.me links hatao
     "clean_filename": env_bool("CLEAN_FILENAME", True),  # file ke naam se username hatao (re-upload lagega)
-    "set_poster": env_bool("SET_POSTER", True),          # video pe TMDB poster thumbnail (abhi OFF - API key nahi hai)
+    "set_poster": env_bool("SET_POSTER", False),         # video pe TMDB poster thumbnail (abhi OFF - API key nahi hai)
     "dedupe": env_bool("DEDUPE", True),                  # pehle bheji hui file dobara na bhejo
     "auto": env_bool("AUTO_FORWARD", True),              # source me nayi post aate hi auto forward
     "notify": env_bool("NOTIFY", True),                  # kaam khatam hone par alag message (ping)
     "delete_quality": env_bool("DELETE_QUALITY", False), # CAM/HDTS/HDTC file quality channel me jaane ke baad source se delete
-    "auto_caption": env_bool("AUTO_CAPTION", True),      # caption khaali ho to TMDB se khud likho (TMDB_API_KEY chahiye)
+    "auto_caption": env_bool("AUTO_CAPTION", False),     # caption khaali ho to TMDB se khud likho (TMDB_API_KEY chahiye)
     "hd_poster": env_bool("HD_POSTER", False),           # movie ke saath TMDB ka bada (HD) poster alag photo me bhi bhejo
-    "name_from_poster": env_bool("NAME_FROM_POSTER", True),  # video me naam na ho to poster (thumbnail) se naam padho (OCR)
-    "frame_thumb": env_bool("FRAME_THUMB", True),        # video ka apna frame thumbnail/cover bane (ffmpeg chahiye)
+    "name_from_poster": env_bool("NAME_FROM_POSTER", False),  # video me naam na ho to poster (thumbnail) se naam padho (OCR)
+    "frame_thumb": env_bool("FRAME_THUMB", True),        # re-upload hone wali / bina-thumbnail wali video ko frame thumbnail (ffmpeg chahiye)
 }
 SETTING_LABELS = {
     "clean_caption": "🧹 Clean caption",
@@ -102,11 +112,16 @@ SETTING_LABELS = {
     "auto_caption": "📝 Auto caption (jahan caption nahi)",
     "hd_poster": "🖼 HD poster photo (video ke upar alag)",
     "name_from_poster": "🔎 Poster se naam padho (naam na ho to)",
-    "frame_thumb": "🎞 Video frame thumbnail",
+    "frame_thumb": "🎞 Video frame thumbnail (jahan zaroori)",
 }
 
 app = Client("cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-             max_concurrent_transmissions=TRANSMISSIONS)
+             max_concurrent_transmissions=max(TRANSMISSIONS, WORKERS), workers=TG_WORKERS)
+# Premium user session: bot 2GB se badi file upload nahi kar sakta, Premium account 4GB tak kar sakta hai.
+# Is account ko SOURCE channel ka member aur TARGET channel ka admin (Post Messages) hona chahiye.
+user_app = (Client("cleaner_user", api_id=API_ID, api_hash=API_HASH, session_string=USER_SESSION, in_memory=True,
+                   max_concurrent_transmissions=max(TRANSMISSIONS, WORKERS), no_updates=True)
+            if USER_SESSION else None)
 START_TIME = time.time()
 
 
@@ -122,6 +137,7 @@ state = {
     "last_job": None,    # {"start","end","last_id","done"} - /resume ke liye
     "totals": {"sent": 0, "dup": 0, "failed": 0},
     "resume_tries": 0,   # bina progress ke auto-resume kitni baar hua
+    "src_last": 0,       # source me dekhi gayi sabse badi message ID (auto-forward se)
 }
 seen: set = set()        # file_unique_id of already-sent files
 dirty = [0]
@@ -148,7 +164,7 @@ def load_state():
     except Exception as e:
         print(f"state load failed: {e}")
         return
-    for k in ("blocks", "failed", "footer", "last_job", "target", "resume_tries"):
+    for k in ("blocks", "failed", "footer", "last_job", "target", "resume_tries", "src_last"):
         if k in data:
             state[k] = data[k]
     state["totals"].update(data.get("totals", {}))
@@ -789,8 +805,25 @@ class StopRequested(Exception):
     """/stop dabane par kaam rokne ke liye."""
 
 
-TRANSIENT = (asyncio.TimeoutError, TimeoutError, ConnectionError,
-             getattr(tg_errors, "InternalServerError", ConnectionError))
+def _err_classes(*names):
+    return tuple(getattr(tg_errors, n) for n in names if hasattr(tg_errors, n))
+
+
+# network / server ki aisi galtiyan jo thodi der baad theek ho jati hain
+TRANSIENT = (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) + _err_classes(
+    "InternalServerError", "ServiceUnavailable", "BadGateway", "GatewayTimeout", "Timeout")
+
+
+def flood_seconds(e) -> int:
+    v = getattr(e, "value", None)
+    if v is None:
+        v = getattr(e, "x", 5)
+    return int(v)
+
+
+def is_permanent(e) -> bool:
+    """Permission / invalid-media jaisi galti: dobara try karne se kuch nahi badlega."""
+    return isinstance(e, tg_errors.RPCError) and getattr(e, "CODE", 0) in (400, 401, 403, 406)
 
 
 def fmt_secs(s: float) -> str:
@@ -815,10 +848,12 @@ async def safe(coro_fn, *args, **kwargs):
         try:
             return await coro_fn(*args, **kwargs)
         except FloodWait as e:
-            wait = int(e.value) + 1
+            wait = flood_seconds(e) + 1
             rate["floods"] += 1
             rate["flood_secs"] += wait
             rate["delay"] = min(max(rate["delay"] * 1.5, 2.0), FLOOD_MAX_DELAY)
+            # sabhi workers ek saath rukenge (throttle() is time tak naya send shuru nahi karta)
+            rate["flood_until"] = max(rate["flood_until"], time.monotonic() + wait)
             print(f"FloodWait: Telegram ne {wait}s rukne ko kaha (delay ab {rate['delay']:.1f}s)")
             await asyncio.sleep(wait)
         except TRANSIENT as e:
@@ -831,6 +866,8 @@ async def safe(coro_fn, *args, **kwargs):
 
 
 async def safe_edit(message: Message, text: str, markup=None):
+    if message is None:
+        return
     try:
         await safe(message.edit_text, text, parse_mode=ParseMode.HTML, reply_markup=markup)
     except MessageNotModified:
@@ -846,6 +883,9 @@ last_send = [0.0]
 
 async def throttle():
     async with send_lock:
+        flood_wait = rate["flood_until"] - time.monotonic()
+        if flood_wait > 0:                       # FloodWait chal raha hai => sab ruk jao
+            await asyncio.sleep(flood_wait)
         wait = last_send[0] + rate["delay"] - time.monotonic()
         if wait > 0:
             await asyncio.sleep(wait)
@@ -861,6 +901,11 @@ async def resolve_channels(target: int = None) -> dict:
             chat = await safe(app.get_chat, cid)
             print(f"{name} OK: {chat.title} ({chat.id})")
             results[name] = None
+            if user_app is not None:      # user session ka peer cache (non-fatal)
+                try:
+                    await safe(user_app.get_chat, cid)
+                except Exception as ue:
+                    print(f"USER session ko {name} ({cid}) nahi dikha: {type(ue).__name__}: {ue}")
         except Exception as e:
             print(f"{name} FAILED ({cid}): {e}")
             results[name] = f"{type(e).__name__}: {e}"
@@ -880,7 +925,7 @@ FILE_ATTRS = ("document", "video", "audio", "photo", "voice", "animation", "vide
 
 def Job(**kw):
     base = dict(kind="skip", text=None, caption=None, msg_id=None, key=None, path=None,
-                thumb=None, name=None, tmp=None, send_as="document", meta=dict(), info=None)
+                thumb=None, name=None, tmp=None, send_as="document", meta=dict(), info=None, msg=None, uploader=None)
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -920,11 +965,11 @@ def copy_job(msg: Message, key, generated: str = "", info=None) -> SimpleNamespa
         caption = with_footer(generated)          # khud likha caption (original me caption tha hi nahi)
     elif captionable and (cfg["clean_caption"] or state["footer"]):
         caption = build_caption(msg.caption or "")
-    return Job(kind="copy", msg_id=msg.id, caption=caption, key=key, info=info)
+    return Job(kind="copy", msg_id=msg.id, msg=msg, caption=caption, key=key, info=info)
 
 
-async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool = None,
-                  media_only: bool = False) -> SimpleNamespace:
+async def _prepare(client: Client, msg: Message, target: int = None, dedupe: bool = None,
+                   media_only: bool = False) -> SimpleNamespace:
     if msg.empty or msg.service:
         return Job(kind="skip")
     if media_only and not file_key(msg):     # 'files' mode: text/poll/etc. skip, sirf file wale messages
@@ -939,7 +984,7 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
     if QUALITY_TARGET is not None and target == QUALITY_TARGET:
         if msg.text:
             return Job(kind="text", text=msg.text[:4096])
-        return Job(kind="copy", msg_id=msg.id, caption=None, key=key)
+        return Job(kind="copy", msg_id=msg.id, msg=msg, caption=None, key=key)
 
     if msg.text:
         t = (clean_text(msg.text) if cfg["clean_caption"] else msg.text)[:4096]
@@ -952,6 +997,9 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
     need_caption = bool(media) and cfg["auto_caption"] and bool(TMDB_API_KEY) and not (msg.caption or "").strip()
     wants_ocr = bool(media) and is_video and cfg["name_from_poster"] and bool(TMDB_API_KEY)
     wants_frame = bool(media) and is_video and cfg["frame_thumb"] and bool(shutil.which("ffmpeg"))
+    # Frame thumbnail tabhi lagta hai jab file waise bhi re-upload ho rahi ho (rename). Warna server-side copy (bahut
+    # fast) me video ka original thumbnail waisa hi rehta hai. Sirf jis video me thumbnail hi nahi, uske liye re-upload.
+    force_frame = wants_frame and not getattr(media, "thumbs", None)
 
     old = media.file_name if media else None
     clean_old = clean_filename(old) if old else None          # block words/@username hata kar (TMDB search saaf rahe)
@@ -972,7 +1020,7 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
 
     generated = caption_from_info(info, old or "") if (need_caption and info) else ""
 
-    if not media or not (wants_rename or wants_poster or from_poster_name or wants_frame):
+    if not media or not (wants_rename or wants_poster or from_poster_name or force_frame):
         return copy_job(msg, key, generated, info if is_video else None)
 
     if from_poster_name:
@@ -983,6 +1031,13 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
         new = old
     title_src = new or (info["title"] if info else "") or first_line or "file"
 
+    fsize = getattr(media, "file_size", 0) or 0
+    big = fsize > MAX_UPLOAD_BYTES      # bot sirf ~2GB tak upload kar sakta hai
+    if big and (user_app is None or fsize > USER_MAX_BYTES):
+        why = "Premium USER_SESSION set nahi hai" if user_app is None else "4GB limit se badi hai"
+        print(f"msg {msg.id}: file {fsize / 1048576:.0f}MB - {why}, copy ho rahi hai (naam nahi badlega)")
+        return copy_job(msg, key, generated, info if is_video else None)
+
     tmp = tempfile.mkdtemp()
     try:
         poster = os.path.join(tmp, "poster.jpg")
@@ -990,12 +1045,20 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
             info, poster, (getattr(media, "width", 0) or 0, getattr(media, "height", 0) or 0)))
 
         # naam pehle se saaf hai aur naya poster nahi => re-upload ki zarurat nahi
-        if new == old and not has_poster and not wants_frame:
+        if new == old and not has_poster and not force_frame:
             shutil.rmtree(tmp, ignore_errors=True)
             return copy_job(msg, key, generated, info if is_video else None)
 
+        await wait_for_disk(tmp, fsize)
+        dl_client, dl_msg, dl_media = client, msg, media
+        if big:             # badi file: Premium user session se download + upload
+            dl_client = user_app
+            dl_msg = await safe(user_app.get_messages, SOURCE, msg.id)
+            dl_media = dl_msg.document or dl_msg.video or dl_msg.audio
+            if dl_media is None:
+                raise RuntimeError("user session ko source me ye file nahi dikhi (session account source channel me hai?)")
         dl_name = os.path.join(tmp, local_name(new)) if new else tmp + os.sep
-        path = await safe(client.download_media, msg, file_name=dl_name,
+        path = await safe(dl_client.download_media, dl_msg, file_name=dl_name,
                           progress=make_progress("dl", title_src))
         running["io"]["dl"] = ""
         if not path:
@@ -1009,12 +1072,13 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
         elif has_poster:
             thumb = poster
         else:
-            thumbs = getattr(media, "thumbs", None)
+            thumbs = getattr(dl_media, "thumbs", None)       # file_id har session ke liye alag hota hai
             if thumbs:
-                thumb = await safe(client.download_media, thumbs[0].file_id,
+                thumb = await safe(dl_client.download_media, thumbs[0].file_id,
                                    file_name=os.path.join(tmp, "thumb.jpg"))
 
         job = Job(kind="upload", path=path, thumb=thumb, name=new, tmp=tmp, key=key,
+                  uploader=dl_client if big else None,
                   info=info if is_video else None,
                   caption=with_footer(generated) if generated
                   else build_caption(msg.caption or "") if (cfg["clean_caption"] or state["footer"])
@@ -1029,6 +1093,45 @@ async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+
+
+inflight: set = set()     # abhi process ho rahi files ke keys (parallel workers me duplicate na jaye)
+
+
+async def wait_for_disk(path: str, size: int):
+    """Parallel workers ki temp files se disk na bhare: jagah banne tak ruko (max ~10 min)."""
+    need = int(size * 1.15) + 64 * 1024 * 1024
+    for _ in range(120):
+        try:
+            if shutil.disk_usage(path).free >= need:
+                return
+        except OSError:
+            return
+        await asyncio.sleep(5)
+    raise RuntimeError("disk me jagah nahi hai (temp files bhari hui hain)")
+
+
+async def prepare(client: Client, msg: Message, target: int = None, dedupe: bool = None,
+                  media_only: bool = False) -> SimpleNamespace:
+    """_prepare() + duplicate guard: ek hi file do workers ek saath na bhejein."""
+    target = target or default_target()
+    dedupe = cfg["dedupe"] if dedupe is None else dedupe
+    key = None if (msg.empty or msg.service) else seen_key(file_key(msg), target)
+    claimed = False
+    if dedupe and key:
+        if key in seen or key in inflight:
+            return Job(kind="dup")
+        inflight.add(key)
+        claimed = True
+    try:
+        job = await _prepare(client, msg, target, dedupe, media_only)
+    except BaseException:
+        if claimed:
+            inflight.discard(key)
+        raise
+    if claimed and job.kind in ("skip", "dup", "text"):
+        inflight.discard(key)
+    return job
 
 
 def cleanup(job):
@@ -1060,7 +1163,8 @@ async def send_hd_poster(client: Client, target: int, info: dict):
     if meta:
         cap += "\n" + " · ".join(meta)
     await throttle()
-    await safe(client.send_photo, target, bio, caption=cap[:1024], parse_mode=ParseMode.DISABLED)
+    await safe(client.send_photo, target, bio, caption=cap[:1024], parse_mode=ParseMode.DISABLED,
+               disable_notification=SILENT)
     seen.add(pkey)
     dirty[0] += 1
 
@@ -1076,15 +1180,27 @@ async def deliver(client: Client, job, target: int) -> str:
             print(f"HD poster send failed: {type(e).__name__}: {e}")
     await throttle()
     if k == "text":
-        await safe(client.send_message, target, job.text, parse_mode=ParseMode.DISABLED)
+        await safe(client.send_message, target, job.text, parse_mode=ParseMode.DISABLED,
+                   disable_notification=SILENT)
     elif k == "copy":
-        extra = {}
+        extra = dict(disable_notification=SILENT)
         if job.caption is not None:
             # reply_markup=None => original ke buttons (jinme telegram link ho sakte hain) copy nahi hote
-            extra = dict(caption=job.caption, parse_mode=ParseMode.DISABLED, reply_markup=None)
-        await safe(client.copy_message, target, SOURCE, job.msg_id, **extra)
+            extra.update(caption=job.caption, parse_mode=ParseMode.DISABLED, reply_markup=None)
+        if job.msg is not None:
+            # message pehle se fetch ho chuka hai => copy_message wala extra get_messages call bach jata hai (fast)
+            try:
+                await safe(job.msg.copy, target, **extra)
+            except tg_errors.RPCError as e:
+                if "FILE_REFERENCE" not in str(getattr(e, "ID", "")):
+                    raise
+                await safe(client.copy_message, target, SOURCE, job.msg_id, **extra)   # purana message => dobara fetch
+        else:
+            await safe(client.copy_message, target, SOURCE, job.msg_id, **extra)
     elif k == "upload":
+        client = job.uploader or client           # badi file => Premium user session se upload
         common = dict(caption=job.caption, parse_mode=ParseMode.DISABLED, thumb=job.thumb,
+                      disable_notification=SILENT,
                       progress=make_progress("ul", job.name or os.path.basename(job.path)))
         if job.name:
             common["file_name"] = job.name
@@ -1109,7 +1225,7 @@ async def handle(client: Client, work, target: int = None) -> str:
             try:
                 return await deliver(client, job, target or default_target())
             except Exception as e:
-                if attempt >= MAX_RETRIES:
+                if attempt >= MAX_RETRIES or is_permanent(e):
                     raise
                 wait = 2 ** attempt
                 print(f"send fail ({type(e).__name__}: {e}) - {wait}s baad retry {attempt}/{MAX_RETRIES}")
@@ -1117,6 +1233,7 @@ async def handle(client: Client, work, target: int = None) -> str:
     finally:
         if job is not None:
             cleanup(job)
+            inflight.discard(job.key)
 
 
 def bump(res: str):
@@ -1131,6 +1248,13 @@ def job_buttons(paused: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("▶️ Resume" if paused else "⏸ Pause", callback_data="job:unpause" if paused else "job:pause"),
         InlineKeyboardButton("⛔ Stop", callback_data="job:stop"),
+    ]])
+
+
+def stop_confirm_buttons() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Haan, Stop karo", callback_data="job:stopyes"),
+        InlineKeyboardButton("↩️ Nahi, chalne do", callback_data="job:stopno"),
     ]])
 
 
@@ -1157,6 +1281,8 @@ def render_panel(title: str, footer: str = "") -> str:
         eta_txt = "calculate ho raha hai..."
     if js.pause_since:
         title += "  ⏸ <b>PAUSED</b>"
+    cool_left = js.cool_until - time.monotonic()
+    cool_txt = f"  ·  🧊 <b>Cooldown</b> <code>{fmt_secs(cool_left)}</code>" if cool_left > 0 else ""
     io_lines = ""
     for icon, k in (("⬇️", "dl"), ("⬆️", "ul")):
         v = running["io"].get(k)
@@ -1174,6 +1300,7 @@ def render_panel(title: str, footer: str = "") -> str:
         f"⏱ <b>Last file</b> <code>{fmt_secs(js.last_took)}</code>  ·  <b>Avg</b> <code>{fmt_secs(avg_file)}</code>\n"
         f"🛡 <b>FloodWait</b> <code>{rate['floods']}</code> baar  ·  <b>Wait</b> <code>{fmt_secs(rate['flood_secs'])}</code>"
         f"  ·  <b>Delay</b> <code>{rate['delay']:.1f}s</code>\n"
+        f"🧵 <b>Workers</b> <code>{WORKERS}</code>{cool_txt}\n"
         f"🕒 <b>Elapsed</b>  <code>{fmt_secs(elapsed)}</code>  ·  <b>ETA</b> <code>{eta_txt}</code>\n"
         f"📍 <b>Current ID</b> <code>{js.last_id}</code> / <code>{js.end_id}</code>"
         f"{io_lines}"
@@ -1235,11 +1362,42 @@ class ChatShim:
         return await self._client.send_message(self.chat.id, text, **kw)
 
 
-async def run_job(client: Client, m: Message, ids, kind: str = "range", target: int = None, dedupe: bool = None,
-                  media_only: bool = False):
-    """ids: range ya list of message IDs. kind: 'range' (checkpoint banta hai) ya 'retry'."""
-    target = target or default_target()
+# Background tasks ka strong reference: asyncio sirf weak reference rakhta hai, isliye bina reference wala task
+# beech kaam me garbage-collect hokar "apne aap cancel" ho sakta hai. Har lamba kaam yahin se chalta hai.
+bg_tasks: set = set()
+
+
+def spawn(coro, name: str = "task"):
+    t = asyncio.create_task(coro, name=name)
+    bg_tasks.add(t)
+
+    def _done(task):
+        bg_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            print(f"background task '{name}' crashed: {type(exc).__name__}: {exc}")
+    t.add_done_callback(_done)
+    return t
+
+
+def launch_job(client: Client, m, ids, kind: str = "range", target: int = None, dedupe: bool = None,
+               media_only: bool = False) -> bool:
+    """Job ko background me chalao (command handler turant free ho jata hai).
+    busy flag yahin, bina await ke set hota hai => do kaam ek saath shuru nahi ho sakte."""
+    if running["busy"] or not len(ids):
+        return False
     running.update(busy=True, stop=False)
+    spawn(run_job(client, m, ids, kind, target, dedupe, media_only), "job")
+    return True
+
+
+async def run_job(client: Client, m, ids, kind: str = "range", target: int = None, dedupe: bool = None,
+                  media_only: bool = False):
+    """ids: range ya list of message IDs. kind: 'range' (checkpoint banta hai) ya 'retry'.
+    Pipeline: 1 producer (messages fetch) + WORKERS parallel workers (prepare -> download -> upload)."""
+    target = target or default_target()
     rate.update(delay=SEND_DELAY, floods=0, flood_secs=0.0)
     gate = asyncio.Event()
     gate.set()
@@ -1252,52 +1410,26 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
         total=len(ids), done=0, sent=0, dup=0, skipped=0, failed=0, failed_ids=[], processed=set(),
         t_start=now, paused_total=0.0, pause_since=None, last_tick=now, last_edit=0.0,
         ewma=0.0, last_took=0.0, first_id=first, end_id=last, last_id=first - 1, status=None,
+        consec_fail=0, cool_until=0.0, cool_level=0, last_cd_notify=0.0, stop_skipped=False, last_error="",
     )
     running["job"] = js
-    if kind == "range":
-        state["last_job"] = {"start": first, "end": last, "last_id": first - 1, "done": False,
-                             "target": target, "dedupe": dedupe, "media_only": media_only}
-        save_state()
+    outcome = "done"
+    status = None
+    done_pos = set()      # poore ho chuke positions
+    wm = [0]              # watermark: shuru se itne IDs lagataar poore ho chuke (resume yahin se hoga)
 
     label = f"📍 Range: <code>{first}</code> → <code>{last}</code>" if kind == "range" \
         else "🔁 <b>Failed IDs dobara try ho rahe hain</b>"
-    status = await m.reply_text(
-        "🚀 <b>Forwarding shuru ho gayi</b>\n"
-        f"📥 Destination: <code>{target}</code> · 📊 Total message: <code>{js.total}</code>\n"
-        "Khatam hone par aapko ek message aayega.\n"
-        "<i>/status · /pause · /stop</i>"
-        if not LIVE_PANEL else
-        "🚀 <b>Forwarding shuru ho gayi</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"{label}\n"
-        f"📥 Destination: <code>{target}</code>{' (sirf files)' if media_only else ''}\n"
-        f"📊 Total message: <code>{js.total}</code>\n"
-        f"⚙️ Pipeline: <code>{PREFETCH}</code> files aage se prepare hongi\n\n"
-        "<i>Baaki time ka andaza kuch messages ke baad dikhega.</i>",
-        parse_mode=ParseMode.HTML, reply_markup=job_buttons(False) if LIVE_PANEL else None,
-    )
-    js.status = status
-    pending = deque()   # (message_id, prepare-task) - order me
+    resume_hint = ("▶️ Aage badhane ke liye: <code>/resume</code>" if kind == "range"
+                   else "▶️ Dobara: <code>/retryfailed</code>")
 
-    async def consume(item):
-        mid, task, item_target, delete_source = item
-        t0 = time.monotonic()
-        try:
-            res = await handle(client, task, item_target)
-            # Source se tabhi delete karo jab destination par sending confirm ho chuki ho.
-            if res == "sent" and delete_source:
-                try:
-                    await safe(client.delete_messages, SOURCE, mid)
-                    print(f"msg {mid}: quality-tagged file sent to {item_target}; source deleted")
-                except Exception as de:     # file ja chuki hai - delete fail hone par 'failed' mat gino
-                    print(f"msg {mid}: sent but source delete failed: {type(de).__name__}: {de}")
-        except Exception as e:
-            res = "failed"
-            print(f"msg {mid} failed: {type(e).__name__}: {e}")
+    # ---------------- helpers ----------------
+    def record(pos, mid, res, took=0.0):
         if res == "sent":
             js.sent += 1
-            js.last_took = time.monotonic() - t0
-            print(f"msg {mid} sent in {fmt_secs(js.last_took)}")
+            js.last_took = took
+            js.consec_fail = 0
+            js.cool_level = 0
         elif res == "dup":
             js.dup += 1
         elif res == "skip":
@@ -1305,7 +1437,9 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
         else:
             js.failed += 1
             js.failed_ids.append(mid)
-        bump(res)
+            js.consec_fail += 1
+        if res != "failed":
+            bump(res)                       # failed ka total job ke end me (retry ke baad) judta hai
         js.done += 1
         js.last_id = max(js.last_id, mid)
         js.processed.add(mid)
@@ -1313,42 +1447,151 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
         dt = tick_now - js.last_tick
         js.last_tick = tick_now
         js.ewma = dt if not js.ewma else js.ewma * 0.9 + dt * 0.1
-        if kind == "range" and state["last_job"]:
-            state["last_job"]["last_id"] = max(state["last_job"]["last_id"], mid)
+        if pos is not None:
+            done_pos.add(pos)
+            while wm[0] in done_pos:        # sirf lagataar poori hui files ka checkpoint (beech ki file na chhute)
+                done_pos.discard(wm[0])
+                wm[0] += 1
+            if kind == "range" and state["last_job"]:
+                state["last_job"]["last_id"] = max(state["last_job"]["last_id"],
+                                                   ids[wm[0] - 1] if wm[0] else first - 1)
         dirty[0] += 1
         maybe_save()
 
+    async def process(pos, mid, msg):
+        item_target, delete_source = destination_for(msg, target)
+        t0 = time.monotonic()
+        try:
+            res = await handle(client, prepare(client, msg, item_target, dedupe, media_only), item_target)
+            # Source se tabhi delete karo jab destination par sending confirm ho chuki ho.
+            if res == "sent" and delete_source:
+                try:
+                    await safe(client.delete_messages, SOURCE, mid)
+                    print(f"msg {mid}: quality-tagged file sent to {item_target}; source deleted")
+                except Exception as de:     # file ja chuki hai - delete fail hone par 'failed' mat gino
+                    print(f"msg {mid}: sent but source delete failed: {type(de).__name__}: {de}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            res = "failed"
+            js.last_error = f"{type(e).__name__}: {e}"
+            print(f"msg {mid} failed: {js.last_error}")
+        if res == "sent":
+            print(f"msg {mid} sent in {fmt_secs(time.monotonic() - t0)}")
+        record(pos, mid, res, time.monotonic() - t0)
+
     async def tick():
-        if not LIVE_PANEL:
+        if not LIVE_PANEL or status is None:
             return
         if time.monotonic() - js.last_edit >= 8:
             js.last_edit = time.monotonic()
             await safe_edit(status, render_panel("🚀 <b>Forwarding in progress</b>"),
                             job_buttons(bool(js.pause_since)))
 
-    outcome = "done"
-    resume_hint = ("▶️ Aage badhane ke liye: <code>/resume</code>" if kind == "range"
-                   else "▶️ Dobara: <code>/retryfailed</code>")
-    try:
-        for i in range(0, len(ids), 100):
-            chunk = list(ids[i:i + 100])
-            msgs = await fetch_chunk(client, chunk)
-            for mid, msg in zip(chunk, msgs):
-                await gate.wait()                       # pause
+    async def nap(seconds: float):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and not running["stop"]:
+            await asyncio.sleep(min(1.0, max(end - time.monotonic(), 0.0)))
+
+    async def arm_cooldown():
+        """Lagataar fail (Telegram/network issue) => kaam CANCEL nahi hota, sab workers thoda ruk kar dobara chalte hain."""
+        js.cool_level += 1
+        wait = min(30 * 2 ** (js.cool_level - 1), 600)
+        js.cool_until = time.monotonic() + wait
+        js.consec_fail = 0
+        print(f"lagataar {COOLDOWN_AFTER} files fail ({js.last_error}) - {wait}s ruk kar dobara chalaunga (kaam cancel nahi)")
+        if time.monotonic() - js.last_cd_notify > 600:
+            js.last_cd_notify = time.monotonic()
+            try:
+                await safe(client.send_message, m.chat.id,
+                           f"⚠️ Lagataar kai files fail hui: <code>{html.escape(js.last_error[:200])}</code>\n"
+                           f"Kaam <b>cancel nahi hua</b> — {fmt_secs(wait)} ruk kar khud dobara chalega.",
+                           parse_mode=ParseMode.HTML)
+            except Exception as e:
+                print(f"cooldown notify failed: {e}")
+
+    async def worker(q):
+        while True:
+            item = await q.get()
+            try:
+                if item is None:
+                    return
+                await gate.wait()                                   # pause
+                while time.monotonic() < js.cool_until and not running["stop"]:
+                    await asyncio.sleep(1)                           # cooldown
                 if running["stop"]:
-                    raise StopRequested
-                item_target, delete_source = destination_for(msg, target)
-                pending.append((mid, asyncio.create_task(prepare(client, msg, item_target, dedupe, media_only)),
-                                item_target, delete_source))
-                while len(pending) >= PREFETCH:         # window bhar gayi => sabse purani bhejo
-                    await consume(pending.popleft())
-                    await tick()
-        while pending:
-            await gate.wait()
-            if running["stop"]:
-                raise StopRequested
-            await consume(pending.popleft())
-            await tick()
+                    js.stop_skipped = True
+                    continue
+                try:
+                    await process(*item)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:                               # worker kabhi marna nahi chahiye
+                    print(f"worker error: {type(e).__name__}: {e}")
+                    js.last_error = f"{type(e).__name__}: {e}"
+                    record(item[0], item[1], "failed")
+                await tick()
+                if js.consec_fail >= COOLDOWN_AFTER and time.monotonic() >= js.cool_until:
+                    await arm_cooldown()
+            finally:
+                q.task_done()
+
+    async def pipeline(id_seq, track: bool):
+        q = asyncio.Queue(maxsize=QUEUE_SIZE)
+        workers = [asyncio.create_task(worker(q)) for _ in range(WORKERS)]
+        try:
+            n = len(id_seq)
+            for i in range(0, n, 100):
+                chunk = list(id_seq[i:i + 100])
+                msgs = await fetch_chunk(client, chunk)
+                for j, (mid, msg) in enumerate(zip(chunk, msgs)):
+                    if running["stop"]:
+                        js.stop_skipped = True
+                        break
+                    await q.put((i + j if track else None, mid, msg))
+                if running["stop"]:
+                    break
+            for _ in workers:
+                await q.put(None)
+            await asyncio.gather(*workers)
+        finally:
+            for w in workers:
+                w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+        if running["stop"] and js.stop_skipped:
+            raise StopRequested
+
+    # ---------------- main ----------------
+    try:
+        if kind == "range":
+            state["last_job"] = {"start": first, "end": last, "last_id": first - 1, "done": False,
+                                 "target": target, "dedupe": dedupe, "media_only": media_only}
+            save_state()
+
+        try:
+            status = await safe(
+                m.reply_text,
+                "🚀 <b>Forwarding shuru ho gayi</b>\n"
+                f"📥 Destination: <code>{target}</code> · 📊 Total message: <code>{js.total}</code>\n"
+                "Khatam hone par aapko ek message aayega.\n"
+                "<i>/status · /pause · /stop</i>"
+                if not LIVE_PANEL else
+                "🚀 <b>Forwarding shuru ho gayi</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"{label}\n"
+                f"📥 Destination: <code>{target}</code>{' (sirf files)' if media_only else ''}\n"
+                f"📊 Total message: <code>{js.total}</code>\n"
+                f"⚙️ <code>{WORKERS}</code> files ek saath parallel chalengi\n\n"
+                "<i>Baaki time ka andaza kuch messages ke baad dikhega.</i>",
+                parse_mode=ParseMode.HTML, reply_markup=job_buttons(False) if LIVE_PANEL else None,
+            )
+        except Exception as e:          # status message na jaye to bhi kaam chalta rahe
+            print(f"status message send failed: {type(e).__name__}: {e}")
+            status = None
+        js.status = status
+
+        await pipeline(ids, True)
+
         # jo files fail hui thi unhe khud dobara bhejo (kuch der ruk kar), taaki sab share hone ke baad hi job khatam ho
         for rnd in range(1, RETRY_ROUNDS + 1):
             if not js.failed_ids:
@@ -1358,18 +1601,11 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
             js.failed_ids.clear()
             js.failed -= len(retry_ids)
             js.done -= len(retry_ids)
-            await asyncio.sleep(min(15 * rnd, 60))
-            for i in range(0, len(retry_ids), 100):
-                chunk = retry_ids[i:i + 100]
-                msgs = await fetch_chunk(client, chunk)
-                for mid, msg in zip(chunk, msgs):
-                    await gate.wait()
-                    if running["stop"]:
-                        raise StopRequested
-                    item_target, delete_source = destination_for(msg, target)
-                    await consume((mid, asyncio.create_task(prepare(client, msg, item_target, dedupe, media_only)),
-                                   item_target, delete_source))
-                    await tick()
+            await nap(min(15 * rnd, 60))
+            if running["stop"]:
+                js.stop_skipped = True
+                raise StopRequested
+            await pipeline(retry_ids, False)
         if LIVE_PANEL:
             await safe_edit(status, render_panel("✅ <b>Forwarding complete</b>"))
     except StopRequested:
@@ -1378,7 +1614,11 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
             # user ne /stop kiya => restart pe auto-resume nahi; bot band hone (SIGTERM) pe roka gaya => auto-resume
             state["last_job"]["user_stopped"] = not running.get("shutdown")
         if LIVE_PANEL:
-            await safe_edit(status, render_panel("⛔ <b>Forwarding roki gayi</b>", resume_hint))
+            hint = "🔄 Restart ke baad khud wahin se resume hoga" if running.get("shutdown") else resume_hint
+            await safe_edit(status, render_panel("⛔ <b>Forwarding roki gayi</b>", hint))
+    except asyncio.CancelledError:
+        outcome = "interrupted"         # process band ho raha hai: done mark NAHI hoga => restart par resume
+        raise
     except Exception as e:
         outcome = "error"
         print(f"run_job crashed: {type(e).__name__}: {e}")
@@ -1386,30 +1626,26 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
             "❌ <b>Error aa gaya</b>",
             f"<code>{html.escape(type(e).__name__ + ': ' + str(e))}</code>\n{resume_hint}"))
     finally:
-        for item in pending:
-            item[1].cancel()
-        leftovers = await asyncio.gather(*(item[1] for item in pending), return_exceptions=True)
-        for r in leftovers:
-            if isinstance(r, SimpleNamespace):
-                cleanup(r)
-        pending.clear()
         if kind == "range" and state["last_job"]:
             state["last_job"]["done"] = (outcome == "done")
         if js.done > 0:
             state["resume_tries"] = 0     # progress hua => auto-resume ka counter reset
         state["failed"] = sorted((set(state["failed"]) - js.processed) | set(js.failed_ids))
+        state["totals"]["failed"] += len(js.failed_ids)
         save_state()
-        summary = (f"{outcome.upper()} — sent {js.sent}, dup {js.dup}, skipped {js.skipped}, failed {js.failed}")
-        print(summary)
+        print(f"{outcome.upper()} — sent {js.sent}, dup {js.dup}, skipped {js.skipped}, failed {js.failed}")
         running.update(busy=False, stop=False, job=None, gate=None)
         running["io"] = {"dl": "", "ul": ""}
 
     # finish notification (naya message => phone pe ping aata hai)
     if cfg["notify"]:
         try:
-            icon = {"done": "✅", "stopped": "⛔", "error": "❌"}[outcome]
+            restart = outcome == "stopped" and bool(running.get("shutdown"))
+            icon = {"done": "✅", "stopped": "🔄" if restart else "⛔", "error": "❌"}[outcome]
+            head = ("🔄 <b>Bot restart ho raha hai</b> — kaam restart ke baad khud wahin se resume hoga"
+                    if restart else f"{icon} <b>Job {outcome}</b>")
             await safe(client.send_message, m.chat.id,
-                       f"{icon} <b>Job {outcome}</b>\n"
+                       f"{head}\n"
                        f"📤 Sent <code>{js.sent}</code> · ♻️ Dup <code>{js.dup}</code> · "
                        f"⏭ Skip <code>{js.skipped}</code> · ❌ Failed <code>{js.failed}</code>\n"
                        f"🕒 <code>{fmt_secs(time.monotonic() - js.t_start - js.paused_total)}</code>"
@@ -1425,7 +1661,7 @@ async def run_job(client: Client, m: Message, ids, kind: str = "range", target: 
             print(f"notify failed: {e}")
 
     if outcome == "error" and kind == "range" and AUTO_RESUME:
-        asyncio.create_task(auto_resume(30, "error"))
+        spawn(auto_resume(30, "error"), "resume")
 
 
 async def auto_resume(delay: float, reason: str):
@@ -1479,8 +1715,8 @@ async def resume_watchdog():
         await asyncio.sleep(60)
         try:
             lj = state["last_job"]
-            if (AUTO_RESUME and ADMINS and not running["busy"] and lj and not lj.get("done")
-                    and lj["last_id"] < lj["end"] and not lj.get("user_stopped")):
+            if (AUTO_RESUME and ADMINS and not running["busy"] and not running.get("shutdown") and lj
+                    and not lj.get("done") and lj["last_id"] < lj["end"] and not lj.get("user_stopped")):
                 await auto_resume(0, "watchdog")
         except asyncio.CancelledError:
             raise
@@ -1492,7 +1728,8 @@ async def start_range_job(client: Client, m: Message, start_id: int, end_id: int
                           target: int = None, dedupe: bool = None, media_only: bool = False):
     if start_id < 1 or end_id < start_id:
         return await m.reply_text("Invalid message ID range. Start ID must be >= 1 and end ID must be >= start ID.")
-    await run_job(client, m, range(start_id, end_id + 1), "range", target, dedupe, media_only)
+    if not launch_job(client, m, range(start_id, end_id + 1), "range", target, dedupe, media_only):
+        await m.reply_text("Ek kaam pehle se chal raha hai. /stop karo ya wait karo.")
 
 
 # ======================================================================
@@ -1513,6 +1750,7 @@ USAGE = (
     "▫️ <code>/resume</code> — roka/adhura kaam wahin se aage\n"
     "▫️ <code>/retryfailed</code> — fail hui files dobara\n"
     "▫️ <code>/status</code> · <code>/pause</code> · <code>/unpause</code> · <code>/stop</code>\n"
+    "▫️ <code>/speed 0.5 4</code> — send delay (sec) aur parallel workers badlo\n"
     "▫️ <code>/settings</code> — features on/off (buttons)\n"
     "▫️ <code>/addblock word</code> · <code>/delblock word</code> · <code>/blocklist</code>\n"
     "▫️ <code>/footer text</code> — har caption ke neeche text (<code>/footer off</code>)\n"
@@ -1613,15 +1851,19 @@ async def clean_cmd(client: Client, m: Message):
 
     if end_id is None:
         try:
-            probe = await safe(client.send_message, SOURCE, ".")
+            probe = await safe(client.send_message, SOURCE, ".", disable_notification=True)
             end_id = probe.id - 1
             await safe(client.delete_messages, SOURCE, probe.id)
         except Exception as e:
-            return await m.reply_text(
-                "Source channel me test message nahi bhej paya.\n"
-                "Bot ko source channel me admin + 'Post Messages' permission do.\n"
-                f"Error: {type(e).__name__}: {e}"
-            )
+            if not state.get("src_last"):
+                return await m.reply_text(
+                    "Source channel me test message nahi bhej paya.\n"
+                    "Bot ko source channel me admin + 'Post Messages' permission do.\n"
+                    "Ya end ID khud do: <code>/sendall 1 9000</code>\n"
+                    f"Error: {html.escape(type(e).__name__ + ': ' + str(e))}", parse_mode=ParseMode.HTML)
+            end_id = state["src_last"]
+            await m.reply_text(f"⚠️ Test message nahi bhej paya, isliye last dekhi gayi ID <code>{end_id}</code> tak jaunga.",
+                               parse_mode=ParseMode.HTML)
     state["resume_tries"] = 0
     await start_range_job(client, m, start_id, end_id, target, dedupe, media_only)
 
@@ -1651,7 +1893,8 @@ async def retry_cmd(client: Client, m: Message):
     res = await resolve_channels()
     if any(res.values()):
         return await m.reply_text("Channel access nahi mil raha. Bot dono channels me admin hai ya nahi check karo.")
-    await run_job(client, m, ids, "retry")
+    if not launch_job(client, m, ids, "retry"):
+        await m.reply_text("Ek kaam pehle se chal raha hai.")
 
 
 @app.on_message(filters.command("dest") & filters.private & admin_filter)
@@ -1685,6 +1928,29 @@ async def setdest_cmd(_, m: Message):
                        parse_mode=ParseMode.HTML)
 
 
+@app.on_message(filters.command("speed") & filters.private & admin_filter)
+async def speed_cmd(_, m: Message):
+    """/speed -> dekho  |  /speed 0.5 -> send delay  |  /speed 0.5 4 -> delay + workers"""
+    global SEND_DELAY, FLOOD_MAX_DELAY, WORKERS, QUEUE_SIZE
+    args = m.command[1:]
+    try:
+        if args:
+            SEND_DELAY = max(float(args[0]), MIN_DELAY)
+            FLOOD_MAX_DELAY = max(FLOOD_MAX_DELAY, SEND_DELAY)
+            rate["delay"] = SEND_DELAY
+        if len(args) > 1:
+            WORKERS = min(max(int(args[1]), 1), 12)
+            QUEUE_SIZE = max(PREFETCH, WORKERS * 2)
+    except ValueError:
+        return await m.reply_text("Use: <code>/speed 0.5</code> ya <code>/speed 0.5 4</code> (delay sec, workers)",
+                                  parse_mode=ParseMode.HTML)
+    await m.reply_text(
+        "⚡ <b>Speed</b>\n"
+        f"⏱ Send delay: <code>{SEND_DELAY:.2f}s</code> (FloodWait aaye to khud badhta hai, max {FLOOD_MAX_DELAY:.1f}s)\n"
+        f"🧵 Workers: <code>{WORKERS}</code> (naye kaam / agle retry round se lagu; 1 = bilkul order me)\n"
+        "<i>Kam delay = tez, par FloodWait zyada. Set: /speed 0.5 4</i>", parse_mode=ParseMode.HTML)
+
+
 @app.on_message(filters.command("stop") & filters.private & admin_filter)
 async def stop_cmd(_, m: Message):
     if do_stop():
@@ -1705,17 +1971,30 @@ async def unpause_cmd(_, m: Message):
     await m.reply_text("▶️ Dobara chalu." if do_unpause() else "Kaam paused nahi hai.")
 
 
-@app.on_callback_query(filters.regex(r"^job:(pause|unpause|stop)$"))
+@app.on_callback_query(filters.regex(r"^job:(pause|unpause|stop|stopyes|stopno)$"))
 async def job_cb(_, cq: CallbackQuery):
     if cq.from_user.id not in ADMINS:
         return await cq.answer("Sirf admin.", show_alert=True)
     act = cq.data.split(":")[1]
-    ok = {"pause": do_pause, "unpause": do_unpause, "stop": do_stop}[act]()
+    js = running.get("job")
+    if act == "stop":          # galti se dabne par kaam cancel na ho => pehle confirm
+        if not (running["busy"] and js):
+            return await cq.answer("Abhi koi kaam nahi chal raha.", show_alert=True)
+        await cq.answer("Pakka stop karna hai?")
+        return await safe_edit(cq.message, render_panel("⚠️ <b>Stop karna hai? Confirm karo</b>"),
+                               stop_confirm_buttons())
+    if act == "stopno":
+        await cq.answer("👍 Kaam chalu hai")
+        if js:
+            await safe_edit(cq.message, render_panel("🚀 <b>Forwarding in progress</b>"),
+                            job_buttons(bool(js.pause_since)))
+        return
+    ok = {"pause": do_pause, "unpause": do_unpause, "stopyes": do_stop}[act]()
     if not ok:
         return await cq.answer("Abhi koi kaam nahi chal raha.", show_alert=True)
-    await cq.answer({"pause": "⏸ Paused", "unpause": "▶️ Resumed", "stop": "⛔ Stopping..."}[act])
+    await cq.answer({"pause": "⏸ Paused", "unpause": "▶️ Resumed", "stopyes": "⛔ Stopping..."}[act])
     js = running.get("job")
-    if js and act != "stop":
+    if js and act != "stopyes":
         await safe_edit(cq.message, render_panel("🚀 <b>Forwarding in progress</b>"),
                         job_buttons(bool(js.pause_since)))
 
@@ -1880,6 +2159,9 @@ auto_queue = None
 
 @app.on_message(filters.chat(SOURCE) & (filters.document | filters.video | filters.audio | filters.photo))
 async def auto(client: Client, m: Message):
+    if m.id > state.get("src_last", 0):
+        state["src_last"] = m.id
+        dirty[0] += 1
     if not cfg["auto"] or auto_queue is None:
         return
     auto_queue.put_nowait(m)
@@ -1920,7 +2202,9 @@ async def auto_worker():
 # ======================================================================
 async def health(_):
     js = running.get("job")
-    return web.json_response({"ok": True, "busy": running["busy"], "sent": js.sent if js else 0})
+    return web.json_response({"ok": True, "busy": running["busy"], "sent": js.sent if js else 0,
+                              "done": js.done if js else 0, "total": js.total if js else 0,
+                              "uptime": int(time.time() - START_TIME)})
 
 
 async def keep_alive():
@@ -1930,7 +2214,7 @@ async def keep_alive():
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         while True:
-            await asyncio.sleep(600)
+            await asyncio.sleep(240)        # Render 15 min bina traffic ke so jata hai
             try:
                 async with s.get(RENDER_URL) as r:
                     await r.read()
@@ -1949,7 +2233,28 @@ async def main():
     runner = web.AppRunner(server)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    await app.start()
+    while True:         # login par FloodWait aaye (baar-baar restart) to crash hone ke bajay ruk kar dobara
+        try:
+            await app.start()
+            break
+        except FloodWait as e:
+            w = flood_seconds(e) + 1
+            print(f"Login FloodWait: {w}s ruk raha hu")
+            await asyncio.sleep(w)
+    global user_app
+    if user_app is not None:
+        try:
+            await user_app.start()
+            me = await user_app.get_me()
+            if getattr(me, "is_premium", False):
+                print(f"Premium user session ready ({me.id}): 4GB tak ki files rename ho sakengi")
+            else:
+                print("USER_SESSION Premium nahi hai - 2GB se badi file upload nahi hogi, session band kar raha hu")
+                await user_app.stop()
+                user_app = None
+        except Exception as e:
+            print(f"USER_SESSION start nahi hua: {type(e).__name__}: {e}")
+            user_app = None
     await resolve_channels()    # peer cache (Peer id invalid fix)
     ka_task = asyncio.create_task(keep_alive())
     aw_task = asyncio.create_task(auto_worker())
@@ -1960,7 +2265,7 @@ async def main():
     if lj and not lj.get("done") and lj["last_id"] < lj["end"]:
         if AUTO_RESUME and ADMINS and not lj.get("user_stopped"):
             print(f"pichla kaam adhura tha (ID {lj['last_id'] + 1} -> {lj['end']}): auto-resume hoga")
-            asyncio.create_task(auto_resume(5, "startup"))
+            spawn(auto_resume(5, "startup"), "resume")
         elif not lj.get("announced"):
             lj["announced"] = True
             save_state()
@@ -1987,17 +2292,24 @@ async def main():
     running["shutdown"] = True      # restart ke baad auto-resume ho sake (ye user ka /stop nahi hai)
     if running["busy"]:
         do_stop()
-        for _ in range(50):    # max ~25s current file khatam hone ka wait
-            if not running["busy"]:
-                break
-            await asyncio.sleep(0.5)
+    jobs = [t for t in bg_tasks if t.get_name() == "job"]
+    if jobs:                        # current files ko khatam hone ka thoda time do
+        await asyncio.wait(jobs, timeout=SHUTDOWN_WAIT)
+    for t in list(bg_tasks):        # jo abhi bhi chal raha ho use band karo (state finally me save hota hai)
+        t.cancel()
+    await asyncio.gather(*list(bg_tasks), return_exceptions=True)
     ka_task.cancel()
     aw_task.cancel()
     wd_task.cancel()
     save_state()
+    if user_app is not None:
+        try:
+            await user_app.stop()
+        except Exception as e:
+            print(f"user session stop failed: {e}")
     await app.stop()
     await runner.cleanup()
 
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+    LOOP.run_until_complete(main())
