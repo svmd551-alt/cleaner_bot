@@ -48,10 +48,27 @@ def env_bool(name: str, default: bool) -> bool:
 API_ID = int(required_env("API_ID"))
 API_HASH = required_env("API_HASH")
 BOT_TOKEN = required_env("BOT_TOKEN")
-ADMINS = [int(x) for x in os.environ.get("ADMINS", "").replace(",", " ").split()]
-SOURCE = int(required_env("SOURCE_CHANNEL"))   # source/database channel ID
-TARGET = int(required_env("TARGET_CHANNEL"))   # normal destination channel ID
-QUALITY_TARGET = int(os.environ["QUALITY_TARGET_CHANNEL"].strip()) if os.environ.get("QUALITY_TARGET_CHANNEL", "").strip() else None  # CAM/TS/TC etc. destination
+# OWNERS = .env ke ADMINS (hamesha admin, doosre admin ko add/remove kar sakte hain). ADMINS = owners + /addadmin wale.
+OWNERS = [int(x) for x in required_env("ADMINS").replace(",", " ").split()]
+ADMINS = list(OWNERS)
+
+
+def _env_chat_id(name: str):
+    """Channel ID ab .env me ZARURI NAHI. Agar daali ho to sirf pehle-start ka default hai;
+    bot ke andar /settings -> Channels se set kiya hua hamesha usse upar rehta hai."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"{name} ek number hona chahiye (-100...), ignore kar diya: {raw!r}")
+        return None
+
+
+ENV_SOURCE = _env_chat_id("SOURCE_CHANNEL")             # optional
+ENV_TARGET = _env_chat_id("TARGET_CHANNEL")             # optional
+ENV_QUALITY = _env_chat_id("QUALITY_TARGET_CHANNEL")    # optional (CAM/TS/TC)
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip()    # free key from themoviedb.org (posters)
 TMDB_API = os.environ.get("TMDB_API_BASE", "https://api.themoviedb.org/3").rstrip("/")   # TMDB block ho to proxy yahan
 TMDB_IMG = os.environ.get("TMDB_IMAGE_BASE", "https://image.tmdb.org/t/p").rstrip("/")
@@ -78,7 +95,10 @@ MAX_UPLOAD_BYTES = int(float(os.environ.get("MAX_UPLOAD_MB", "1990")) * 1024 * 1
 USER_SESSION = os.environ.get("USER_SESSION", "").strip()        # Premium account ka Pyrogram session string (2GB-4GB files ke liye)
 USER_MAX_BYTES = int(float(os.environ.get("USER_MAX_MB", "3990")) * 1024 * 1024)   # Premium upload limit ~4GB
 SILENT = env_bool("SILENT", True)                                # True => target channel me bulk sending bina notification ke
-TG_WORKERS = max(4, int(os.environ.get("TG_WORKERS", "8")))      # Pyrogram ke handler workers
+TG_WORKERS = max(4, int(os.environ.get("TG_WORKERS", "8")))      # Pyrogram ke handler workers (sirf start par lagta hai)
+BACKUP_HOURS = max(0, int(os.environ.get("BACKUP_HOURS", "0")))    # har itne ghante me state file owner ko DM (0 = band)
+ENV_TMDB_KEY = TMDB_API_KEY                                      # /settings se badla hua key isse upar rehta hai
+ENV_OCR_KEY = OCR_SPACE_KEY
 
 # Telegram guideline: ek chat me ~1 message/second se zyada nahi. Isliye delay 1s se kam allowed nahi.
 MIN_DELAY = 0.5      # FloodWait aaye to delay khud badh jata hai (safe() dekho), isliye thoda tez rakha
@@ -101,7 +121,45 @@ cfg = {
     "hd_poster": env_bool("HD_POSTER", False),           # movie ke saath TMDB ka bada (HD) poster alag photo me bhi bhejo
     "name_from_poster": env_bool("NAME_FROM_POSTER", False),  # video me naam na ho to poster (thumbnail) se naam padho (OCR)
     "frame_thumb": env_bool("FRAME_THUMB", True),        # re-upload hone wali / bina-thumbnail wali video ko frame thumbnail (ffmpeg chahiye)
+    "silent": SILENT,                                    # target me bina notification ke bhejo
+    "live_panel": LIVE_PANEL,                            # job ke dauran live progress panel
+    "auto_resume": AUTO_RESUME,                          # restart/error ke baad adhura kaam khud resume
+    "startup_notify": STARTUP_NOTIFY,                    # start/restart par admin ko message
+    "error_alerts": env_bool("ERROR_ALERTS", True),      # auto-forward fail hone par admin ko DM
+    "auto_video": True, "auto_document": True,           # auto-forward me kaun si types jayein
+    "auto_audio": True, "auto_photo": True,
 }
+ENV_CFG = dict(cfg)         # "Defaults" button isi par wapas jata hai
+
+# Number wale settings (/settings me ➖/➕). g = global ka naam jo bot use karta hai.
+NUM_SPECS = {
+    "workers":          dict(g="WORKERS", label="🧵 Workers", type=int, min=1, max=12, step=1,
+                             hint="ek saath kitni files download/upload hon (1 = bilkul order me)"),
+    "prefetch":         dict(g="PREFETCH", label="📥 Prefetch", type=int, min=1, max=10, step=1,
+                             hint="aage se kitni files pehle se tayyar rakhni hain"),
+    "send_delay":       dict(g="SEND_DELAY", label="⏱ Send delay", type=float, min=0.5, max=10.0, step=0.5, unit="s",
+                             hint="do sends ke beech ka gap (kam = tez, par FloodWait zyada)"),
+    "flood_max_delay":  dict(g="FLOOD_MAX_DELAY", label="🛡 Flood max delay", type=float, min=1.0, max=60.0, step=1.0, unit="s",
+                             hint="FloodWait ke baad delay iske upar nahi jayega"),
+    "max_retries":      dict(g="MAX_RETRIES", label="🔁 Retries", type=int, min=1, max=10, step=1,
+                             hint="network/send error par ek file ke liye kitni koshish"),
+    "retry_rounds":     dict(g="RETRY_ROUNDS", label="♻️ Retry rounds", type=int, min=0, max=10, step=1,
+                             hint="job ke end me failed files itni baar khud dobara (0 = band)"),
+    "cooldown_after":   dict(g="COOLDOWN_AFTER", label="🧊 Cooldown after", type=int, min=3, max=30, step=1,
+                             hint="lagataar itni files fail => thoda ruk kar dobara"),
+    "max_auto_resumes": dict(g="MAX_AUTO_RESUMES", label="🔄 Max auto-resume", type=int, min=0, max=50, step=1,
+                             hint="bina progress ke max auto-resume (0 = jab tak kaam poora na ho)"),
+    "shutdown_wait":    dict(g="SHUTDOWN_WAIT", label="⏳ Shutdown wait", type=int, min=5, max=120, step=5, unit="s",
+                             hint="restart par current files ke liye max wait"),
+    "frame_at":         dict(g="FRAME_AT", label="🎞 Frame at", type=float, min=0.0, max=0.95, step=0.05, pct=True,
+                             hint="video ke kitne % hisse par se thumbnail frame liya jaye"),
+    "ocr_min_score":    dict(g="OCR_MIN_SCORE", label="🔎 OCR match score", type=float, min=0.3, max=1.0, step=0.05, pct=True,
+                             hint="poster se padhe naam ka TMDB match kitna strict ho"),
+    "backup_hours":     dict(g="BACKUP_HOURS", label="💾 Auto-backup", type=int, min=0, max=168, step=6, unit="h",
+                             hint="har itne ghante me state file owner ko DM (0 = band)"),
+}
+nums = {k: globals()[sp["g"]] for k, sp in NUM_SPECS.items()}
+ENV_NUMS = dict(nums)
 SETTING_LABELS = {
     "clean_caption": "🧹 Clean caption",
     "clean_filename": "✂️ Clean file name",
@@ -114,6 +172,15 @@ SETTING_LABELS = {
     "hd_poster": "🖼 HD poster photo (video ke upar alag)",
     "name_from_poster": "🔎 Poster se naam padho (naam na ho to)",
     "frame_thumb": "🎞 Video frame thumbnail (jahan zaroori)",
+    "silent": "🔕 Silent send (bina notification)",
+    "live_panel": "📊 Live progress panel",
+    "auto_resume": "🔄 Auto-resume (restart/error ke baad)",
+    "startup_notify": "🟢 Start/restart par message",
+    "error_alerts": "🚨 Error alerts (auto-forward fail)",
+    "auto_video": "🎬 Auto: videos",
+    "auto_document": "📄 Auto: documents",
+    "auto_audio": "🎵 Auto: audio",
+    "auto_photo": "🖼 Auto: photos",
 }
 
 app = Client("cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
@@ -139,24 +206,109 @@ state = {
     "totals": {"sent": 0, "dup": 0, "failed": 0},
     "resume_tries": 0,   # bina progress ke auto-resume kitni baar hua
     "src_last": 0,       # source me dekhi gayi sabse badi message ID (auto-forward se)
+    "source": None,      # /settings -> Channels se chuna source (None => env SOURCE_CHANNEL, agar di ho)
+    "quality": None,     # None => env QUALITY_TARGET_CHANNEL | 0 => band | id => CAM/TS/TC channel
+    "admins": [],        # /addadmin se jude extra admins (OWNERS alag hain, .env se)
+    "domains": [],       # extra link domains jo caption/naam se hatane hain
+    "texts": {},         # tmdb_key / ocr_key (bot ke andar se set)
+    "last_backup": 0,
+    "legacy_target": None,   # purani (env wale) target ki duplicate-memory bina prefix ke hai => us target ko pehchano
 }
 seen: set = set()        # file_unique_id of already-sent files
 dirty = [0]
 
 
-def default_target() -> int:
-    """Default destination: /setdest se set kiya hua, warna env TARGET_CHANNEL."""
-    return state.get("target") or TARGET
+def get_source():
+    """Source/database channel: bot ke andar set kiya hua, warna (optional) env."""
+    return state.get("source") or ENV_SOURCE
+
+
+def default_target():
+    """Default destination: bot ke andar set kiya hua, warna (optional) env."""
+    return state.get("target") or ENV_TARGET
+
+
+def get_quality():
+    """CAM/TS/TC channel. state['quality'] == 0 => jaan-boojh kar band."""
+    q = state.get("quality")
+    if q is None:
+        return ENV_QUALITY
+    return q or None
 
 
 def seen_key(key, target: int):
     """Duplicate check har destination ke liye alag (env TARGET ke keys pehle jaise hi rehte hain)."""
     if not key:
         return None
-    return key if target == TARGET else f"{target}:{key}"
+    legacy = ENV_TARGET if ENV_TARGET is not None else state.get("legacy_target")
+    return key if (legacy is not None and target == legacy) else f"{target}:{key}"
+
+
+def refresh_admins():
+    extra = [a for a in state.get("admins", []) if isinstance(a, int) and a not in OWNERS]
+    ADMINS[:] = OWNERS + extra
+
+
+def clamp_num(key: str, value):
+    sp = NUM_SPECS[key]
+    v = min(max(float(value), sp["min"]), sp["max"])
+    return int(round(v)) if sp["type"] is int else round(v, 2)
+
+
+def apply_runtime():
+    """cfg / nums / texts me jo bhi badla ho use bot ke live variables me lagao (restart ki zarurat nahi)."""
+    global QUEUE_SIZE, SILENT, LIVE_PANEL, AUTO_RESUME, STARTUP_NOTIFY, TMDB_API_KEY, OCR_SPACE_KEY, FLOOD_MAX_DELAY
+    g = globals()
+    for k, sp in NUM_SPECS.items():
+        g[sp["g"]] = nums[k]
+    FLOOD_MAX_DELAY = max(FLOOD_MAX_DELAY, SEND_DELAY)
+    QUEUE_SIZE = max(PREFETCH, WORKERS * 2)
+    SILENT, LIVE_PANEL = bool(cfg["silent"]), bool(cfg["live_panel"])
+    AUTO_RESUME, STARTUP_NOTIFY = bool(cfg["auto_resume"]), bool(cfg["startup_notify"])
+    texts = state.get("texts") or {}
+    TMDB_API_KEY = (texts.get("tmdb_key") or ENV_TMDB_KEY or "").strip()
+    OCR_SPACE_KEY = (texts.get("ocr_key") or ENV_OCR_KEY or "").strip()
+    if not running["busy"]:
+        rate["delay"] = SEND_DELAY
+
+
+def set_num(key: str, value):
+    nums[key] = clamp_num(key, value)
+    apply_runtime()
+    save_state()
+    return nums[key]
 
 
 STATE_FOUND = False      # restart ke baad purani progress file mili ya nahi (Render free par disk nahi hoti)
+
+
+def apply_state_data(data: dict):
+    """State dict (file ya /restore backup) ko live state me lagao."""
+    for k in ("blocks", "failed", "footer", "last_job", "target", "source", "quality", "admins", "domains",
+              "texts", "resume_tries", "src_last", "last_backup", "legacy_target"):
+        if k in data:
+            state[k] = data[k]
+    if not isinstance(state.get("texts"), dict):
+        state["texts"] = {}
+    for k in ("blocks", "failed", "admins", "domains"):
+        if not isinstance(state.get(k), list):
+            state[k] = []
+    state["admins"] = [int(a) for a in state["admins"] if str(a).lstrip("-").isdigit()]
+    state["totals"].update(data.get("totals", {}))
+    seen.update(data.get("seen", []))
+    for k, v in (data.get("cfg") or {}).items():
+        if k in cfg:
+            cfg[k] = bool(v)
+    for k, v in (data.get("opts") or {}).items():
+        if k in NUM_SPECS:
+            try:
+                nums[k] = clamp_num(k, v)
+            except (TypeError, ValueError):
+                pass
+    refresh_admins()
+    rebuild_block_re()
+    rebuild_link_re()
+    apply_runtime()
 
 
 def load_state():
@@ -170,25 +322,23 @@ def load_state():
     except Exception as e:
         print(f"state load failed: {e}")
         return
-    for k in ("blocks", "failed", "footer", "last_job", "target", "resume_tries", "src_last"):
-        if k in data:
-            state[k] = data[k]
-    state["totals"].update(data.get("totals", {}))
-    seen.update(data.get("seen", []))
-    for k, v in (data.get("cfg") or {}).items():
-        if k in cfg:
-            cfg[k] = bool(v)
+    apply_state_data(data)
     print(f"state loaded: {len(seen)} files remembered")
+
+
+def snapshot() -> dict:
+    data = dict(state)
+    data["seen"] = list(seen)
+    data["cfg"] = dict(cfg)
+    data["opts"] = dict(nums)
+    return data
 
 
 def save_state():
     try:
-        data = dict(state)
-        data["seen"] = list(seen)
-        data["cfg"] = dict(cfg)
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+            json.dump(snapshot(), f)
         os.replace(tmp, STATE_FILE)
         dirty[0] = 0
     except Exception as e:
@@ -205,9 +355,19 @@ def maybe_save(force: bool = False):
 # ======================================================================
 # Hatane wale link domains: mdisk hamesha; aur chahiye to env EXTRA_LINK_DOMAINS="site1.com,site2.net"
 _EXTRA_DOMAINS = [d.strip().lower() for d in os.environ.get("EXTRA_LINK_DOMAINS", "").split(",") if d.strip()]
-_LINK_DOMAINS = "|".join([r"mdisk\.[a-z]{2,}"] + [re.escape(d) for d in _EXTRA_DOMAINS])
-LINK_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/\S+|tg://\S+"
-                     r"|(?:https?://)?(?:[\w-]+\.)*(?:" + _LINK_DOMAINS + r")(?:/\S*)?", re.I)
+LINK_RE = None
+
+
+def rebuild_link_re():
+    """Hatane wale link domains: mdisk hamesha + env EXTRA_LINK_DOMAINS + /settings se jude domains."""
+    global LINK_RE
+    extra = sorted({d for d in _EXTRA_DOMAINS + [x.lower() for x in state.get("domains", [])] if d})
+    doms = "|".join([r"mdisk\.[a-z]{2,}"] + [re.escape(d) for d in extra])
+    LINK_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/\S+|tg://\S+"
+                         r"|(?:https?://)?(?:[\w-]+\.)*(?:" + doms + r")(?:/\S*)?", re.I)
+
+
+rebuild_link_re()
 # link hatane ke baad bacha hua akela label ("Online Play link:") bhi hatao
 LINK_LABEL_RE = re.compile(r"^\W*(?:online\s+)?(?:play|watch|stream|download|direct|mdisk)\s*(?:link|url)?s?\W*$", re.I)
 WWW_RE = re.compile(r"\bwww\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b", re.I)
@@ -254,8 +414,9 @@ def has_quality_tag(msg: Message) -> bool:
 
 def destination_for(msg: Message, fallback: int) -> tuple[int, bool]:
     """Return (destination, should_delete_source_after_success). Delete sirf /settings me ON ho tab."""
-    if QUALITY_TARGET is not None and has_quality_tag(msg):
-        return QUALITY_TARGET, bool(cfg["delete_quality"])
+    q = get_quality()
+    if q is not None and has_quality_tag(msg):
+        return q, bool(cfg["delete_quality"])
     return fallback, False
 
 
@@ -899,12 +1060,19 @@ async def throttle():
         rate["delay"] = max(SEND_DELAY, rate["delay"] * 0.95)   # flood ke baad jaldi normal
 
 
+chan_cache: dict = {}      # chat_id -> title (settings screen me naam dikhane ke liye)
+
+
 async def resolve_channels(target: int = None) -> dict:
-    """SOURCE aur destination ko resolve karo taaki Pyrogram peer cache me save kar le."""
+    """Source aur destination ko resolve karo taaki Pyrogram peer cache me save kar le."""
     results = {}
-    for name, cid in (("SOURCE", SOURCE), ("TARGET", target or default_target())):
+    for name, cid in (("SOURCE", get_source()), ("TARGET", target or default_target())):
+        if not cid:
+            results[name] = "set nahi hai (/settings -> 📡 Channels)"
+            continue
         try:
             chat = await safe(app.get_chat, cid)
+            chan_cache[cid] = chat.title or str(cid)
             print(f"{name} OK: {chat.title} ({chat.id})")
             results[name] = None
             if user_app is not None:      # user session ka peer cache (non-fatal)
@@ -915,6 +1083,13 @@ async def resolve_channels(target: int = None) -> dict:
         except Exception as e:
             print(f"{name} FAILED ({cid}): {e}")
             results[name] = f"{type(e).__name__}: {e}"
+    q = get_quality()
+    if q:                                  # quality channel optional hai => fail hone par job nahi rukta
+        try:
+            chat = await safe(app.get_chat, q)
+            chan_cache[q] = chat.title or str(q)
+        except Exception as e:
+            print(f"QUALITY FAILED ({q}): {type(e).__name__}: {e}")
     return results
 
 
@@ -924,7 +1099,18 @@ async def resolve_channels(target: int = None) -> dict:
 #    deliver()  -> Telegram pe bhejna (order me, throttle ke saath)
 # ======================================================================
 running = {"busy": False, "stop": False, "job": None, "gate": None, "io": {"dl": "", "ul": ""}}
-admin_filter = filters.user(ADMINS) if ADMINS else filters.user([])   # ADMINS khaali => koi nahi (fail closed)
+async def _is_admin(_, __, update):
+    u = getattr(update, "from_user", None)
+    return bool(u and u.id in ADMINS)           # ADMINS live list hai (/addadmin turant lagu)
+
+
+async def _is_owner(_, __, update):
+    u = getattr(update, "from_user", None)
+    return bool(u and u.id in OWNERS)
+
+
+admin_filter = filters.create(_is_admin)
+owner_filter = filters.create(_is_owner)
 
 FILE_ATTRS = ("document", "video", "audio", "photo", "voice", "animation", "video_note", "sticker")
 
@@ -987,7 +1173,8 @@ async def _prepare(client: Client, msg: Message, target: int = None, dedupe: boo
         return Job(kind="dup")
 
     # Quality channel (CAM/TS/TC): file, naam aur caption bilkul original rehte hain (no clean, no footer, no poster)
-    if QUALITY_TARGET is not None and target == QUALITY_TARGET:
+    q = get_quality()
+    if q is not None and target == q:
         if msg.text:
             return Job(kind="text", text=msg.text[:4096])
         return Job(kind="copy", msg_id=msg.id, msg=msg, caption=None, key=key)
@@ -1059,7 +1246,7 @@ async def _prepare(client: Client, msg: Message, target: int = None, dedupe: boo
         dl_client, dl_msg, dl_media = client, msg, media
         if big:             # badi file: Premium user session se download + upload
             dl_client = user_app
-            dl_msg = await safe(user_app.get_messages, SOURCE, msg.id)
+            dl_msg = await safe(user_app.get_messages, get_source(), msg.id)
             dl_media = dl_msg.document or dl_msg.video or dl_msg.audio
             if dl_media is None:
                 raise RuntimeError("user session ko source me ye file nahi dikhi (session account source channel me hai?)")
@@ -1200,9 +1387,9 @@ async def deliver(client: Client, job, target: int) -> str:
             except tg_errors.RPCError as e:
                 if "FILE_REFERENCE" not in str(getattr(e, "ID", "")):
                     raise
-                await safe(client.copy_message, target, SOURCE, job.msg_id, **extra)   # purana message => dobara fetch
+                await safe(client.copy_message, target, get_source(), job.msg_id, **extra)   # purana message => dobara fetch
         else:
-            await safe(client.copy_message, target, SOURCE, job.msg_id, **extra)
+            await safe(client.copy_message, target, get_source(), job.msg_id, **extra)
     elif k == "upload":
         client = job.uploader or client           # badi file => Premium user session se upload
         common = dict(caption=job.caption, parse_mode=ParseMode.DISABLED, thumb=job.thumb,
@@ -1351,7 +1538,7 @@ async def fetch_chunk(client: Client, chunk):
     while not running.get("stop"):
         attempt += 1
         try:
-            return await safe(client.get_messages, SOURCE, chunk)
+            return await safe(client.get_messages, get_source(), chunk)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1480,7 +1667,7 @@ async def run_job(client: Client, m, ids, kind: str = "range", target: int = Non
             # Source se tabhi delete karo jab destination par sending confirm ho chuki ho.
             if res == "sent" and delete_source:
                 try:
-                    await safe(client.delete_messages, SOURCE, mid)
+                    await safe(client.delete_messages, get_source(), mid)
                     print(f"msg {mid}: quality-tagged file sent to {item_target}; source deleted")
                 except Exception as de:     # file ja chuki hai - delete fail hone par 'failed' mat gino
                     print(f"msg {mid}: sent but source delete failed: {type(de).__name__}: {de}")
@@ -1762,36 +1949,44 @@ async def start_range_job(client: Client, m: Message, start_id: int, end_id: int
 USAGE = (
     "📖 <b>Commands</b>\n"
     "━━━━━━━━━━━━━━━━━━\n"
+    "🛠 <b>Setup (sab bot ke andar)</b>\n"
+    "▫️ <code>/settings</code> — saari settings (channels, cleaning, poster, speed, alerts, backup...)\n"
+    "▫️ <code>/channels</code> — Source / Target / Quality channel set karo (forward ya ID/@username/link se)\n"
+    "▫️ <code>/setsource</code> · <code>/setdest</code> · <code>/setquality</code> — shortcut (<code>reset</code> / <code>off</code> bhi)\n"
+    "▫️ <code>/dest</code> — abhi ke channels dekho\n\n"
+    "🚀 <b>Forward</b>\n"
     "▫️ <code>/sendall</code> — source ki saari files\n"
     "▫️ <code>/sendall 500</code> — ID 500 se aage ki saari files\n"
-    "▫️ <code>/sendall -1001234567890</code> — saari files <b>dusre folder/channel</b> me\n"
-    "▫️ <code>/sendall @channelname</code> — public channel ko username/link se bhi de sakte ho\n"
-    "▫️ <code>QUALITY_TARGET_CHANNEL</code> — CAM/TS/TC-tagged files ka separate channel (/settings me <b>Delete quality files</b> ON ho to successful send ke baad source se delete; HDRip normal channel me jata hai)\n"
-    "▫️ <code>/sendall -1001234567890 files</code> — sirf files (text messages skip)\n"
+    "▫️ <code>/sendall -1001234567890</code> — saari files <b>dusre channel</b> me (ya <code>@channelname</code>)\n"
+    "▫️ <code>/sendall -1001234567890 files</code> — sirf files (text skip)\n"
     "▫️ <code>/sendall 500 -1001234567890 force</code> — ID 500 se, us channel me, duplicate check ke bina\n"
-    "▫️ <code>/clean 100 200 [channel_id] [force]</code> — sirf ek range (start, end ID)\n"
-    "▫️ <code>/setdest -100...</code> — default destination badlo (<code>/setdest reset</code> = env wala) · <code>/dest</code> — dekho\n"
-    "▫️ <code>/resume</code> — roka/adhura kaam wahin se aage\n"
-    "▫️ <code>/retryfailed</code> — fail hui files dobara\n"
-    "▫️ <code>/status</code> · <code>/pause</code> · <code>/unpause</code> · <code>/stop</code>\n"
-    "▫️ <code>/speed 0.5 4</code> — send delay (sec) aur parallel workers badlo\n"
-    "▫️ <code>/settings</code> — features on/off (buttons)\n"
+    "▫️ <code>/clean 100 200 [channel_id] [force]</code> — sirf ek range\n"
+    "▫️ <code>/resume</code> · <code>/retryfailed</code> · <code>/status</code> · <code>/pause</code> · <code>/unpause</code> · <code>/stop</code>\n"
+    "▫️ <code>/speed 0.5 4</code> — send delay (sec) aur workers\n\n"
+    "🧹 <b>Cleaning</b>\n"
     "▫️ <code>/addblock word</code> · <code>/delblock word</code> · <code>/blocklist</code>\n"
-    "▫️ <code>/footer text</code> — har caption ke neeche text (<code>/footer off</code>)\n"
-    "▫️ <code>/poster Jawan 2023</code> — TMDB test · kisi video pe reply karke <code>/poster</code> — poster se naam padhna test\n"
-    "▫️ <code>/stats</code> · <code>/resetseen</code>\n\n"
-    "<i>Saari files ke liye bot ko source channel me admin + Post Messages permission chahiye.</i>"
+    "▫️ <code>/footer text</code> (<code>/footer off</code>)\n"
+    "▫️ <code>/poster Jawan 2023</code> — TMDB test (video pe reply karke bhi)\n\n"
+    "💾 <b>Data / Admin</b>\n"
+    "▫️ <code>/backup</code> — state file DM me · <code>/restore</code> — backup file pe reply karke\n"
+    "▫️ <code>/admins</code> · <code>/addadmin id</code> · <code>/deladmin id</code> (sirf owner)\n"
+    "▫️ <code>/stats</code> · <code>/resetseen</code> · <code>/cancel</code>\n\n"
+    "<i>Bot ko source channel me admin (Post Messages) aur target me admin (Post Messages) banao.</i>"
 )
 
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(_, m: Message):
+    hint = ""
+    if m.from_user and m.from_user.id in ADMINS and (not get_source() or not default_target()):
+        hint = ("\n\n⚠️ <b>Channels abhi set nahi hain.</b> /settings → 📡 Channels me jaake "
+                "Source aur Target set karo.")
     await m.reply_text(
         "✨ <b>Channel Cleaner &amp; Forwarder</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "Source channel ki files ko saaf karke (caption/file name se @username, links hata kar, "
         "poster laga kar) target channel me bhejta hoon.\n\n"
-        f"{USAGE}",
+        f"{USAGE}{hint}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1860,6 +2055,9 @@ async def clean_cmd(client: Client, m: Message):
     target = dest or default_target()
     dedupe = False if force else None
 
+    miss = missing_channels(target)
+    if miss:
+        return await m.reply_text(miss, parse_mode=ParseMode.HTML, reply_markup=channels_shortcut())
     res = await resolve_channels(target)
     bad = {k: v for k, v in res.items() if v}
     if bad:
@@ -1868,16 +2066,16 @@ async def clean_cmd(client: Client, m: Message):
             "Channel access nahi mil raha:\n"
             f"{lines}\n\n"
             "Check karo:\n"
-            "1. SOURCE_CHANNEL / destination channel ID sahi hai (-100 se shuru)\n"
-            "2. Wahi bot (wahi BOT_TOKEN) dono channels me admin hai\n"
+            "1. /settings → 📡 Channels me Source/Target sahi set hain (🔍 Access test dabao)\n"
+            "2. Wahi bot dono channels me admin hai\n"
             "3. Source me 'Post Messages', destination me bhi 'Post Messages' permission di hai"
         )
 
     if end_id is None:
         try:
-            probe = await safe(client.send_message, SOURCE, ".", disable_notification=True)
+            probe = await safe(client.send_message, get_source(), ".", disable_notification=True)
             end_id = probe.id - 1
-            await safe(client.delete_messages, SOURCE, probe.id)
+            await safe(client.delete_messages, get_source(), probe.id)
         except Exception as e:
             if not state.get("src_last"):
                 return await m.reply_text(
@@ -1900,9 +2098,12 @@ async def resume_cmd(client: Client, m: Message):
     if not lj or lj.get("done") or lj["last_id"] >= lj["end"]:
         return await m.reply_text("Aisa koi adhura kaam nahi mila. /sendall se naya shuru karo.")
     target = lj.get("target") or default_target()
+    miss = missing_channels(target)
+    if miss:
+        return await m.reply_text(miss, parse_mode=ParseMode.HTML, reply_markup=channels_shortcut())
     res = await resolve_channels(target)
     if any(res.values()):
-        return await m.reply_text("Channel access nahi mil raha. Bot dono channels me admin hai ya nahi check karo.")
+        return await m.reply_text("Channel access nahi mil raha. /settings → 📡 Channels → 🔍 Access test se check karo.")
     state["resume_tries"] = 0
     await start_range_job(client, m, lj["last_id"] + 1, lj["end"], target, lj.get("dedupe"), lj.get("media_only", False))
 
@@ -1914,57 +2115,63 @@ async def retry_cmd(client: Client, m: Message):
     ids = sorted(set(state["failed"]))
     if not ids:
         return await m.reply_text("✅ Koi failed file pending nahi hai.")
+    miss = missing_channels()
+    if miss:
+        return await m.reply_text(miss, parse_mode=ParseMode.HTML, reply_markup=channels_shortcut())
     res = await resolve_channels()
     if any(res.values()):
-        return await m.reply_text("Channel access nahi mil raha. Bot dono channels me admin hai ya nahi check karo.")
+        return await m.reply_text("Channel access nahi mil raha. /settings → 📡 Channels → 🔍 Access test se check karo.")
     if not launch_job(client, m, ids, "retry"):
         await m.reply_text("Ek kaam pehle se chal raha hai.")
 
 
-@app.on_message(filters.command("dest") & filters.private & admin_filter)
+@app.on_message(filters.command(["dest", "channels"]) & filters.private & admin_filter)
 async def dest_cmd(_, m: Message):
-    t = default_target()
-    src = "env TARGET_CHANNEL" if not state.get("target") else "/setdest"
-    await m.reply_text(f"📥 Default destination: <code>{t}</code> ({src})\n"
-                       f"📤 Source (database): <code>{SOURCE}</code>", parse_mode=ParseMode.HTML)
+    text, kb = render_page("channels")
+    await m.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-@app.on_message(filters.command("setdest") & filters.private & admin_filter)
-async def setdest_cmd(_, m: Message):
-    if running["busy"]:
-        return await m.reply_text("Ek kaam chal raha hai. Pehle /stop karo ya khatam hone do.")
+@app.on_message(filters.command(["setsource", "setdest", "settarget", "setquality"]) & filters.private & admin_filter)
+async def setchan_cmd(client: Client, m: Message):
+    """/setdest -1001234567890 | /setdest @name | /setdest (phir forward) | /setquality off | /setdest reset"""
+    role = {"setsource": "source", "setdest": "target", "settarget": "target",
+            "setquality": "quality"}[m.command[0].lower()]
     arg = (m.command[1] if len(m.command) > 1 else "").strip()
-    if arg.lower() == "reset":
-        state["target"] = None
+    if arg.lower() in ("reset", "off"):
+        if running["busy"]:
+            return await m.reply_text("Ek kaam chal raha hai. Pehle /stop karo ya khatam hone do.")
+        if arg.lower() == "off" and role != "quality":
+            return await m.reply_text("Sirf Quality channel band (<code>off</code>) ho sakta hai. Source/Target ke liye "
+                                      "<code>reset</code> ya naya channel do.", parse_mode=ParseMode.HTML)
+        state[role] = 0 if arg.lower() == "off" else None
         save_state()
-        return await m.reply_text(f"♻️ Destination wapas env wala: <code>{TARGET}</code>", parse_mode=ParseMode.HTML)
-    if not re.fullmatch(r"-?\d+", arg):
-        return await m.reply_text("Use: <code>/setdest -1001234567890</code>  |  <code>/setdest reset</code>",
-                                  parse_mode=ParseMode.HTML)
-    cid = int(arg)
-    res = await resolve_channels(cid)
-    if res.get("TARGET"):
-        return await m.reply_text(f"Is destination tak pahunch nahi paya: {res['TARGET']}\n"
-                                  "Bot ko us channel me admin + Post Messages permission do.")
-    state["target"] = cid
-    save_state()
-    await m.reply_text(f"✅ Default destination ab <code>{cid}</code>. /sendall se saari files wahan jayengi.",
-                       parse_mode=ParseMode.HTML)
+        return await m.reply_text(f"✅ {CHANNEL_ROLES[role]['label']}: " +
+                                  ("band kar diya." if arg.lower() == "off" else
+                                   f"reset (env wala: {chan_label(role_value(role))})."), parse_mode=ParseMode.HTML)
+    ref = None
+    rep_chat = _fwd_chat(m.reply_to_message) if m.reply_to_message else None
+    if rep_chat:
+        ref = rep_chat.id
+    elif arg:
+        ref = parse_chat_ref(arg)
+        if ref is None:
+            return await m.reply_text("Ye channel ID/@username/link nahi lag raha. Aise do: "
+                                      "<code>/setdest -1001234567890</code> ya <code>/setdest @channelname</code>",
+                                      parse_mode=ParseMode.HTML)
+    if ref is None:
+        return await ask_channel(m, m.from_user.id, role)
+    await do_assign(client, m, role, ref)
 
 
 @app.on_message(filters.command("speed") & filters.private & admin_filter)
 async def speed_cmd(_, m: Message):
     """/speed -> dekho  |  /speed 0.5 -> send delay  |  /speed 0.5 4 -> delay + workers"""
-    global SEND_DELAY, FLOOD_MAX_DELAY, WORKERS, QUEUE_SIZE
     args = m.command[1:]
     try:
         if args:
-            SEND_DELAY = max(float(args[0]), MIN_DELAY)
-            FLOOD_MAX_DELAY = max(FLOOD_MAX_DELAY, SEND_DELAY)
-            rate["delay"] = SEND_DELAY
+            set_num("send_delay", args[0])
         if len(args) > 1:
-            WORKERS = min(max(int(args[1]), 1), 12)
-            QUEUE_SIZE = max(PREFETCH, WORKERS * 2)
+            set_num("workers", args[1])
     except ValueError:
         return await m.reply_text("Use: <code>/speed 0.5</code> ya <code>/speed 0.5 4</code> (delay sec, workers)",
                                   parse_mode=ParseMode.HTML)
@@ -1972,7 +2179,8 @@ async def speed_cmd(_, m: Message):
         "⚡ <b>Speed</b>\n"
         f"⏱ Send delay: <code>{SEND_DELAY:.2f}s</code> (FloodWait aaye to khud badhta hai, max {FLOOD_MAX_DELAY:.1f}s)\n"
         f"🧵 Workers: <code>{WORKERS}</code> (naye kaam / agle retry round se lagu; 1 = bilkul order me)\n"
-        "<i>Kam delay = tez, par FloodWait zyada. Set: /speed 0.5 4</i>", parse_mode=ParseMode.HTML)
+        "<i>Kam delay = tez, par FloodWait zyada. Set: /speed 0.5 4  ·  Ya /settings → ⚡ Performance</i>",
+        parse_mode=ParseMode.HTML)
 
 
 @app.on_message(filters.command("stop") & filters.private & admin_filter)
@@ -2073,46 +2281,769 @@ async def poster_cmd(client: Client, m: Message):
         await m.reply_text(f"{caption}\n\n⚠️ Poster download fail: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
 
 
-# ---------- settings ----------
-def settings_markup() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{'✅' if cfg[k] else '❌'} {label}", callback_data=f"set:{k}")]
-        for k, label in SETTING_LABELS.items()
-    ])
+# ======================================================================
+#  CHANNELS + SETTINGS  (sab kuch bot ke andar: /settings)
+#   - Source / Target / Quality channel ab .env me nahi, yahin se set hote hain
+#   - Har feature ka on/off + number (➖/➕) + text (footer, block words, TMDB key...) yahin
+# ======================================================================
+def _btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, callback_data=data)
 
 
-def settings_text() -> str:
-    footer = html.escape(state["footer"]) if state["footer"] else "—"
-    words = len(set(BLOCK_WORDS + state["blocks"]))
+CHANNEL_ROLES = {
+    "source": dict(label="📤 Source (database)"),
+    "target": dict(label="📥 Target (destination)"),
+    "quality": dict(label="🎬 Quality (CAM/TS/TC)"),
+}
+pending: dict = {}          # admin user_id -> {"kind", "role", "ts"}  (bot abhi us admin se kuch maang raha hai)
+
+
+def role_value(role: str):
+    return {"source": get_source, "target": default_target, "quality": get_quality}[role]()
+
+
+def chan_label(cid) -> str:
+    if not cid:
+        return "—"
+    title = chan_cache.get(cid)
+    return f"{html.escape(title)} (<code>{cid}</code>)" if title else f"<code>{cid}</code>"
+
+
+def quality_label() -> str:
+    if state.get("quality") == 0:
+        return "band (off)"
+    return chan_label(get_quality())
+
+
+def missing_channels(target=None) -> str:
+    miss = []
+    if not get_source():
+        miss.append("📤 Source")
+    if not (target or default_target()):
+        miss.append("📥 Target")
+    if not miss:
+        return ""
+    return "⚠️ Pehle channel set karo: <b>" + ", ".join(miss) + "</b>\n/settings → 📡 Channels"
+
+
+def channels_shortcut() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[_btn("📡 Channels set karo", "m:channels")]])
+
+
+def _fwd_chat(m):
+    """Forward kiye gaye message ka original chat (Pyrogram + Pyrofork dono ke liye)."""
+    if m is None:
+        return None
+    c = getattr(m, "forward_from_chat", None)
+    if c:
+        return c
+    fo = getattr(m, "forward_origin", None)
+    return getattr(fo, "chat", None) if fo else None
+
+
+def parse_chat_ref(text: str):
+    """-100123.. | 123456789 | t.me/c/123/45 | @name | t.me/name  ->  int ya '@name'. Samajh na aaye to None."""
+    t = (text or "").strip().split()
+    if not t:
+        return None
+    t = t[0]
+    if re.fullmatch(r"-?\d{5,}", t):
+        n = int(t)
+        return n if n < 0 else int("-100" + t)          # bina -100 ke diya to channel maan lo
+    m = re.fullmatch(r"(?:https?://)?t\.me/c/(\d+)(?:/\S*)?", t, re.I)
+    if m:
+        return int("-100" + m.group(1))
+    m = re.fullmatch(r"(?:https?://)?t\.me/(\+\S+|joinchat/\S+)", t, re.I)
+    if m:
+        return t if t.startswith("http") else "https://" + t
+    m = re.fullmatch(r"(?:https?://)?t\.me/(\w{4,})(?:/\S*)?", t, re.I)
+    if m:
+        return "@" + m.group(1)
+    if re.fullmatch(r"@\w{4,}", t):
+        return t
+    return None
+
+
+async def bot_rights(chat_id, chat_type: str = "") -> dict:
+    try:
+        mem = await safe(app.get_chat_member, chat_id, "me")
+    except Exception as e:
+        return {"ok": False, "err": type(e).__name__}
+    status = str(getattr(mem.status, "name", mem.status)).upper()
+    admin = status in ("OWNER", "ADMINISTRATOR")
+    pr = getattr(mem, "privileges", None)
+    channel = str(chat_type).upper().endswith("CHANNEL")
+    can_post = admin and (status == "OWNER" or not channel or bool(getattr(pr, "can_post_messages", False)))
+    can_del = admin and (status == "OWNER" or bool(getattr(pr, "can_delete_messages", False)))
+    return {"ok": True, "admin": admin, "can_post": can_post, "can_delete": can_del, "status": status}
+
+
+def rights_line(role: str, r: dict) -> str:
+    if not r.get("ok"):
+        return f"❌ Bot is chat me nahi dikh raha ({html.escape(str(r.get('err')))}) — pehle bot ko admin banao"
+    if not r["admin"]:
+        return "❌ Bot <b>admin nahi</b> hai — admin banao (Post Messages ke saath)"
+    tick = lambda b: "✅" if b else "❌"
+    line = f"Admin ✅ · Post {tick(r['can_post'])} · Delete {tick(r['can_delete'])}"
+    if role in ("target", "quality") and not r["can_post"]:
+        line += "\n⚠️ Yahan bhejne ke liye <b>Post Messages</b> permission chahiye"
+    if role == "source" and cfg["delete_quality"] and not r["can_delete"]:
+        line += "\n⚠️ 'Delete quality files' ON hai par <b>Delete Messages</b> permission nahi"
+    return line
+
+
+async def access_report() -> str:
+    lines = ["🔍 <b>Access check</b>", "━━━━━━━━━━━━━━━━━━"]
+    for role in ("source", "target", "quality"):
+        cid = role_value(role)
+        label = CHANNEL_ROLES[role]["label"]
+        if not cid:
+            lines.append(f"{label}\n   {'— (optional, band)' if role == 'quality' else '❌ set nahi hai'}")
+            continue
+        try:
+            chat = await safe(app.get_chat, cid)
+            chan_cache[cid] = chat.title or str(cid)
+            r = await bot_rights(cid, str(getattr(chat.type, "name", chat.type)))
+            lines.append(f"{label}\n   {html.escape(chat.title or '')} <code>{cid}</code>\n   {rights_line(role, r)}")
+        except Exception as e:
+            lines.append(f"{label}\n   <code>{cid}</code> ❌ {html.escape(type(e).__name__)} — bot ko channel me admin banao")
+    if user_app is not None:
+        lines.append("\n👤 Premium user session: ✅ (badi files ke liye)")
+    return "\n".join(lines)
+
+
+async def assign_channel(role: str, cid: int, title: str = "") -> str:
+    if role == "source" and running["busy"]:
+        raise ValueError("Ek kaam chal raha hai — source badalne se pehle /stop karo ya khatam hone do.")
+    for r in CHANNEL_ROLES:
+        if r != role and role_value(r) == cid:
+            raise ValueError(f"Ye channel pehle se {CHANNEL_ROLES[r]['label']} hai. Alag channel chuno.")
+    prev = role_value(role)
+    state[role] = cid
+    if title:
+        chan_cache[cid] = title
+    notes = []
+    if (role == "target" and ENV_TARGET is None and state.get("legacy_target") is None
+            and any(":" not in str(k) for k in seen)):
+        state["legacy_target"] = cid       # .env se hata di gayi purani target ki memory yahi se jud jati hai
+    if role == "source" and prev != cid:
+        state["src_last"] = 0
+        state["failed"] = []
+        state["resume_tries"] = 0
+        lj = state.get("last_job")
+        if lj and not lj.get("done"):
+            notes.append("ℹ️ Purane source ka adhura kaam clear kar diya.")
+        state["last_job"] = None
+    save_state()
+    out = f"✅ {CHANNEL_ROLES[role]['label']} ab: {chan_label(cid)}"
+    if notes:
+        out += "\n" + "\n".join(notes)
+    return out
+
+
+async def do_assign(client: Client, m: Message, role: str, ref) -> bool:
+    try:
+        chat = await safe(client.get_chat, ref)
+    except Exception as e:
+        await m.reply_text(
+            f"❌ Channel nahi mila ya access nahi: <code>{html.escape(type(e).__name__)}</code>\n\n"
+            "• Bot ko pehle us channel me <b>admin</b> banao\n"
+            "• Sirf ID kaam na kare to us channel ka <b>koi message yahan forward</b> kar do",
+            parse_mode=ParseMode.HTML)
+        return False
+    ctype = str(getattr(chat.type, "name", chat.type)).upper()
+    if ctype not in ("CHANNEL", "SUPERGROUP", "GROUP"):
+        await m.reply_text("❌ Ye channel/group nahi hai. Channel ka ID/@username/link do.")
+        return False
+    rights = await bot_rights(chat.id, ctype)
+    try:
+        info = await assign_channel(role, chat.id, chat.title or "")
+    except ValueError as e:
+        await m.reply_text(f"⚠️ {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        return False
+    await m.reply_text(f"{info}\n{rights_line(role, rights)}", parse_mode=ParseMode.HTML,
+                       reply_markup=InlineKeyboardMarkup([[_btn("📡 Channels", "m:channels"),
+                                                           _btn("⚙️ Settings", "m:main")]]))
+    return True
+
+
+async def ask_channel(m: Message, uid: int, role: str):
+    pending[uid] = {"kind": "chan", "role": role, "ts": time.time()}
+    extra = "\n\n<i>Quality optional hai: CAM/TS/TC-tagged files is channel me jayengi.</i>" if role == "quality" else ""
+    await m.reply_text(
+        f"{CHANNEL_ROLES[role]['label']} <b>set karo</b>\n\n"
+        "1️⃣ Us channel ka <b>koi bhi message yahan forward karo</b> (sabse aasan), ya\n"
+        "2️⃣ Channel ka ID (<code>-100...</code>), <code>@username</code> ya <code>t.me/...</code> link bhejo.\n\n"
+        "⚠️ Bot ko pehle us channel me <b>admin</b> banao (Post Messages ke saath)."
+        f"{extra}\n\n<i>/cancel se wapas.</i>",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[_btn("❌ Cancel", "c:cancel")]]))
+
+
+# ---------- alerts / backup helpers ----------
+alert_last: dict = {}
+
+
+async def notify_admins(text: str, key: str = "gen", every: float = 120.0):
+    """Admins ko DM (same key ka alert 'every' sec me ek hi baar, spam nahi)."""
+    if not cfg.get("error_alerts"):
+        return
+    now = time.monotonic()
+    if key in alert_last and now - alert_last[key] < every:
+        return
+    alert_last[key] = now
+    for a in list(ADMINS):
+        try:
+            await app.send_message(a, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            print(f"alert to {a} failed: {type(e).__name__}: {e}")
+
+
+async def setup_nag():
+    miss = [CHANNEL_ROLES[r]["label"] for r, v in (("source", get_source()), ("target", default_target())) if not v]
+    if not miss:
+        return
+    for a in list(ADMINS):
+        try:
+            await app.send_message(
+                a, "🛠 <b>Setup baaki hai</b>\n" + "\n".join(f"❌ {x}" for x in miss) +
+                "\n\nBot ko apne channels me admin banao, phir neeche button dabao — channel ka message forward karna "
+                "ya ID bhejna kaafi hai. .env me kuch dalne ki zarurat nahi.",
+                parse_mode=ParseMode.HTML, reply_markup=channels_shortcut())
+        except Exception as e:
+            print(f"setup notify failed for {a}: {type(e).__name__}: {e}")
+
+
+async def send_backup(chat_id, caption: str = "💾 Backup"):
+    save_state()
+    bio = BytesIO(json.dumps(snapshot()).encode("utf-8"))
+    bio.name = time.strftime("cleaner_backup_%Y%m%d_%H%M.json")
+    await app.send_document(chat_id, bio, caption=f"{caption}\n\nRestore: is file par reply karke /restore\n"
+                            "⚠️ Isme API keys ho sakti hain — kisi ko forward mat karna.", disable_notification=True)
+
+
+async def backup_loop():
+    while True:
+        await asyncio.sleep(600)
+        try:
+            if BACKUP_HOURS <= 0 or not (seen or get_source()):
+                continue
+            if time.time() - state.get("last_backup", 0) < BACKUP_HOURS * 3600:
+                continue
+            state["last_backup"] = time.time()
+            for owner in OWNERS:
+                await send_backup(owner, "🕒 Auto-backup")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"backup error: {type(e).__name__}: {e}")
+
+
+# ---------- settings pages ----------
+PAGES = {
+    "clean": dict(title="🧹 Cleaning", intro="Caption aur file naam se kya hatana hai.",
+                  bools=["clean_caption", "clean_filename", "dedupe"], nums=[], prompts=["footer", "blocks", "domains"]),
+    "media": dict(title="🎬 Media & Poster",
+                  intro="TMDB poster, caption, OCR aur thumbnail. Poster/caption features ke liye TMDB key chahiye.",
+                  bools=["set_poster", "hd_poster", "auto_caption", "name_from_poster", "frame_thumb"],
+                  nums=["frame_at", "ocr_min_score"], prompts=["tmdb_key", "ocr_key"]),
+    "forward": dict(title="📤 Forwarding", intro="Source ki nayi posts kaise aur kaun si jayein.",
+                    bools=["auto", "auto_video", "auto_document", "auto_audio", "auto_photo", "silent", "delete_quality"],
+                    nums=[], prompts=[]),
+    "perf": dict(title="⚡ Performance", intro="Speed vs FloodWait ka balance.",
+                 bools=["live_panel"], nums=["workers", "prefetch", "send_delay", "flood_max_delay"], prompts=[]),
+    "reliab": dict(title="🔁 Reliability", intro="Error, restart aur retry ka behaviour.",
+                   bools=["auto_resume"],
+                   nums=["max_retries", "retry_rounds", "cooldown_after", "max_auto_resumes", "shutdown_wait"], prompts=[]),
+    "alerts": dict(title="🔔 Alerts & Backup", intro="Kab message aaye aur state ka backup.",
+                   bools=["notify", "startup_notify", "error_alerts"], nums=["backup_hours"], prompts=[]),
+}
+PAGES_ALL = set(PAGES) | {"main", "channels", "system"}
+ZERO_TXT = {"retry_rounds": "off", "backup_hours": "off", "max_auto_resumes": "∞"}
+
+PROMPTS = {
+    "footer": ("📝 Footer", "Har caption ke neeche jaane wala text bhejo.\nHatane ke liye <code>off</code> bhejo."),
+    "blocks": ("🚫 Block words",
+               "Jo words/@usernames caption aur file naam se hatane hain, comma se alag karke bhejo.\n"
+               "Hatane ke liye <code>-word</code> · list ke liye <code>list</code>."),
+    "domains": ("🔗 Extra link domains",
+                "Jin sites ke links hatane hain (mdisk pehle se hai), comma se alag: <code>site1.com, site2.net</code>\n"
+                "Hatane ke liye <code>-site1.com</code> · list ke liye <code>list</code>."),
+    "tmdb_key": ("🔑 TMDB key", "themoviedb.org ki v3 API key ya v4 token bhejo.\nHatane ke liye <code>off</code>. "
+                                "(Tumhara message mai delete kar dunga.)"),
+    "ocr_key": ("🔑 OCR.space key", "ocr.space ki free key bhejo (Tesseract na ho tab kaam aati hai).\n"
+                                    "Hatane ke liye <code>off</code>. (Tumhara message mai delete kar dunga.)"),
+}
+
+
+def prompt_status(kind: str) -> str:
+    if kind == "footer":
+        return "set ✅" if state["footer"] else "—"
+    if kind == "blocks":
+        return str(len(set(BLOCK_WORDS + state["blocks"])))
+    if kind == "domains":
+        return str(len(set(_EXTRA_DOMAINS + state.get("domains", []))))
+    if kind == "tmdb_key":
+        return "set ✅" if TMDB_API_KEY else "❌"
+    if kind == "ocr_key":
+        return "set ✅" if OCR_SPACE_KEY else "❌"
+    return ""
+
+
+def fmt_num(k: str) -> str:
+    sp, v = NUM_SPECS[k], nums[k]
+    if v == 0 and k in ZERO_TXT:
+        return ZERO_TXT[k]
+    if sp.get("pct"):
+        return f"{v * 100:.0f}%"
+    return f"{v:g}{sp.get('unit', '')}"
+
+
+def main_text() -> str:
+    on = lambda k: "✅" if cfg[k] else "❌"
+    warn = "\n⚠️ <b>Pehle 📡 Channels set karo.</b>\n" if not (get_source() and default_target()) else ""
     return (
         "⚙️ <b>Settings</b>\n━━━━━━━━━━━━━━━━━━\n"
-        "Button dabake on/off karo (turant lagu, restart ke baad bhi yaad rehta hai).\n\n"
-        f"📝 Footer: <code>{footer}</code>\n"
-        f"🚫 Block words: <code>{words}</code>\n"
-        f"🖼 TMDB key: <code>{'set' if TMDB_API_KEY else 'NOT SET (poster nahi lagega)'}</code>\n"
-        f"🔎 Poster OCR: <code>{ocr_status()}</code>"
+        f"📤 Source: {chan_label(get_source()) if get_source() else '❌ set nahi'}\n"
+        f"📥 Target: {chan_label(default_target()) if default_target() else '❌ set nahi'}\n"
+        f"🎬 Quality: {quality_label()}\n{warn}\n"
+        f"📡 Auto {on('auto')}  🧹 Caption {on('clean_caption')}  ✂️ Naam {on('clean_filename')}  ♻️ Dedupe {on('dedupe')}\n"
+        f"⚡ Workers <code>{WORKERS}</code> · Delay <code>{SEND_DELAY:g}s</code>\n"
+        f"🖼 TMDB {'✅' if TMDB_API_KEY else '❌'}  📝 Footer {'✅' if state['footer'] else '—'}\n\n"
+        "Section chuno. Sab turant lagu hota hai aur restart ke baad bhi yaad rehta hai."
     )
 
 
-@app.on_message(filters.command("settings") & filters.private & admin_filter)
-async def settings_cmd(_, m: Message):
-    await m.reply_text(settings_text(), parse_mode=ParseMode.HTML, reply_markup=settings_markup())
+def main_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_btn("📡 Channels", "m:channels")],
+        [_btn("🧹 Cleaning", "m:clean"), _btn("🎬 Media & Poster", "m:media")],
+        [_btn("📤 Forwarding", "m:forward"), _btn("⚡ Performance", "m:perf")],
+        [_btn("🔁 Reliability", "m:reliab"), _btn("🔔 Alerts & Backup", "m:alerts")],
+        [_btn("🛠 System", "m:system"), _btn("✖️ Close", "m:close")],
+    ])
 
 
-@app.on_callback_query(filters.regex(r"^set:"))
-async def settings_cb(_, cq: CallbackQuery):
-    if cq.from_user.id not in ADMINS:
-        return await cq.answer("Sirf admin.", show_alert=True)
-    key = cq.data.split(":", 1)[1]
-    if key not in cfg:
-        return await cq.answer("Unknown setting.")
-    cfg[key] = not cfg[key]
-    save_state()
-    await cq.answer(f"{SETTING_LABELS[key]}: {'ON' if cfg[key] else 'OFF'}")
+def channels_text() -> str:
+    return (
+        "📡 <b>Channels</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"📤 <b>Source</b> — jahan se files aati hain\n   {chan_label(get_source()) if get_source() else '❌ set nahi'}\n"
+        f"📥 <b>Target</b> — jahan bhejni hain\n   {chan_label(default_target()) if default_target() else '❌ set nahi'}\n"
+        f"🎬 <b>Quality</b> — CAM/TS/TC alag channel (optional)\n   {quality_label()}\n\n"
+        "Button dabao → channel ka <b>koi message forward karo</b> ya ID/@username/link bhejo.\n"
+        "Bot ko pehle us channel me admin banana hoga. Naye channel me bot ko admin banaoge to mai khud poochh lunga."
+    )
+
+
+def channels_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_btn("📤 Source set", "c:source"), _btn("📥 Target set", "c:target")],
+        [_btn("🎬 Quality set", "c:quality"), _btn("🚫 Quality off", "c:qoff")],
+        [_btn("🔍 Access test", "x:test")],
+        [_btn("⬅️ Back", "m:main")],
+    ])
+
+
+def system_text() -> str:
     try:
-        await cq.message.edit_text(settings_text(), parse_mode=ParseMode.HTML, reply_markup=settings_markup())
+        fsize = os.path.getsize(STATE_FILE) / 1024
+    except OSError:
+        fsize = 0
+    owners = "\n".join(f"   👑 <code>{a}</code>" for a in OWNERS)
+    extra = "\n".join(f"   👤 <code>{a}</code>" for a in ADMINS if a not in OWNERS)
+    try:
+        ocr = ocr_status()
+    except Exception:
+        ocr = "?"
+    return (
+        "🛠 <b>System</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Admins:\n{owners}{chr(10) + extra if extra else ''}\n"
+        f"⏳ Uptime <code>{fmt_secs(time.time() - START_TIME)}</code>\n"
+        f"🧠 Yaad rakhi files <code>{len(seen)}</code> · 💾 State <code>{fsize:.0f} KB</code>\n"
+        f"🔎 Poster OCR: <code>{html.escape(str(ocr))}</code>\n"
+        f"👤 Premium session: <code>{'on' if user_app is not None else 'off'}</code>\n"
+        f"🕒 Last backup: <code>{time.strftime('%d %b %H:%M', time.localtime(state['last_backup'])) if state.get('last_backup') else '—'}</code>\n\n"
+        "<i>Render free par disk restart pe saaf hoti hai — 💾 Backup le lo ya Alerts me auto-backup chalu karo.</i>"
+    )
+
+
+def system_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_btn("💾 Backup bhejo", "x:backup"), _btn("🔍 Access test", "x:test")],
+        [_btn("⬅️ Back", "m:main")],
+    ])
+
+
+def render_page(page: str):
+    if page == "main":
+        return main_text(), main_markup()
+    if page == "channels":
+        return channels_text(), channels_markup()
+    if page == "system":
+        return system_text(), system_markup()
+    sp = PAGES[page]
+    lines = [f"{sp['title']}\n━━━━━━━━━━━━━━━━━━\n{sp['intro']}"]
+    for k in sp["nums"]:
+        lines.append(f"▫️ <b>{NUM_SPECS[k]['label']}</b> — {NUM_SPECS[k]['hint']}")
+    for kind in sp["prompts"]:
+        lines.append(f"▫️ <b>{PROMPTS[kind][0]}</b>: <code>{prompt_status(kind)}</code>")
+    rows = []
+    for k in sp["bools"]:
+        rows.append([_btn(f"{'✅' if cfg[k] else '❌'} {SETTING_LABELS[k]}", f"t:{k}:{page}")])
+    for k in sp["nums"]:
+        rows.append([_btn("➖", f"n:{k}:-:{page}"), _btn(f"{NUM_SPECS[k]['label']}: {fmt_num(k)}", f"n:{k}:i:{page}"),
+                     _btn("➕", f"n:{k}:+:{page}")])
+    for kind in sp["prompts"]:
+        rows.append([_btn(f"{PROMPTS[kind][0]}: {prompt_status(kind)}", f"p:{kind}")])
+    rows.append([_btn("↩️ Defaults", f"d:{page}"), _btn("⬅️ Back", "m:main")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def show_page(cq: CallbackQuery, page: str):
+    text, kb = render_page(page)
+    try:
+        await cq.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except MessageNotModified:
         pass
+
+
+@app.on_message(filters.command(["settings", "config"]) & filters.private & admin_filter)
+async def settings_cmd(_, m: Message):
+    text, kb = render_page("main")
+    await m.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@app.on_callback_query(filters.regex(r"^(?:set|t|n|d|m|c|p|x|aj):"))
+async def settings_cb(client: Client, cq: CallbackQuery):
+    if cq.from_user.id not in ADMINS:
+        return await cq.answer("Sirf admin.", show_alert=True)
+    parts = cq.data.split(":")
+    act = parts[0]
+    uid = cq.from_user.id
+
+    if act == "m":
+        page = parts[1] if len(parts) > 1 else "main"
+        await cq.answer()
+        if page == "close":
+            try:
+                await cq.message.delete()
+            except Exception:
+                pass
+            return
+        return await show_page(cq, page if page in PAGES_ALL else "main")
+
+    if act in ("set", "t"):                         # "set:" purane settings message ke liye
+        key = parts[1]
+        page = parts[2] if len(parts) > 2 and parts[2] in PAGES_ALL else "main"
+        if key not in cfg:
+            return await cq.answer("Unknown setting.")
+        cfg[key] = not cfg[key]
+        apply_runtime()
+        save_state()
+        await cq.answer(f"{SETTING_LABELS.get(key, key)}: {'ON' if cfg[key] else 'OFF'}")
+        return await show_page(cq, page)
+
+    if act == "n":
+        key, op = parts[1], parts[2]
+        page = parts[3] if len(parts) > 3 and parts[3] in PAGES_ALL else "main"
+        if key not in NUM_SPECS:
+            return await cq.answer("Unknown setting.")
+        sp = NUM_SPECS[key]
+        if op == "i":
+            return await cq.answer(f"{sp['label']}: {sp['hint']}", show_alert=True)
+        old = nums[key]
+        new = set_num(key, old + (sp["step"] if op == "+" else -sp["step"]))
+        if new == old:
+            return await cq.answer("Limit tak pahunch gaye.")
+        await cq.answer(f"{sp['label']}: {fmt_num(key)}")
+        return await show_page(cq, page)
+
+    if act == "d":
+        page = parts[1] if len(parts) > 1 else "main"
+        if page not in PAGES:
+            return await cq.answer()
+        for k in PAGES[page]["bools"]:
+            cfg[k] = ENV_CFG[k]
+        for k in PAGES[page]["nums"]:
+            nums[k] = ENV_NUMS[k]
+        apply_runtime()
+        save_state()
+        await cq.answer("↩️ Defaults par wapas")
+        return await show_page(cq, page)
+
+    if act == "c":
+        what = parts[1] if len(parts) > 1 else ""
+        if what == "cancel":
+            pending.pop(uid, None)
+            await cq.answer("Cancel")
+            try:
+                await cq.message.delete()
+            except Exception:
+                pass
+            return
+        if what == "qoff":
+            state["quality"] = 0
+            save_state()
+            await cq.answer("Quality channel band")
+            return await show_page(cq, "channels")
+        if what in CHANNEL_ROLES:
+            await cq.answer()
+            return await ask_channel(cq.message, uid, what)
+        return await cq.answer()
+
+    if act == "p":
+        kind = parts[1] if len(parts) > 1 else ""
+        if kind not in PROMPTS:
+            return await cq.answer()
+        pending[uid] = {"kind": kind, "ts": time.time()}
+        await cq.answer()
+        title, help_text = PROMPTS[kind]
+        return await cq.message.reply_text(
+            f"<b>{title}</b>\n\n{help_text}\n\n<i>/cancel se wapas.</i>", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[_btn("❌ Cancel", "c:cancel")]]))
+
+    if act == "x":
+        what = parts[1] if len(parts) > 1 else ""
+        if what == "test":
+            await cq.answer("Check kar raha hu...")
+            report = await access_report()
+            try:
+                await cq.message.edit_text(report, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(
+                    [[_btn("🔄 Dobara", "x:test"), _btn("⬅️ Back", "m:channels")]]))
+            except MessageNotModified:
+                pass
+            return
+        if what == "backup":
+            await cq.answer("Backup bhej raha hu...")
+            return await send_backup(cq.message.chat.id)
+        return await cq.answer()
+
+    if act == "aj":                                  # bot kisi channel me admin bana => role chuno
+        role = parts[1] if len(parts) > 1 else ""
+        if role == "no":
+            await cq.answer("Theek hai")
+            try:
+                await cq.message.delete()
+            except Exception:
+                pass
+            return
+        if role not in CHANNEL_ROLES or len(parts) < 3:
+            return await cq.answer()
+        cid = int(parts[2])
+        try:
+            chat = await safe(client.get_chat, cid)
+            info = await assign_channel(role, cid, chat.title or "")
+        except ValueError as e:
+            return await cq.answer(str(e), show_alert=True)
+        except Exception as e:
+            return await cq.answer(f"Error: {type(e).__name__}", show_alert=True)
+        await cq.answer("Set ho gaya")
+        try:
+            await cq.message.edit_text(info, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(
+                [[_btn("📡 Channels", "m:channels")]]))
+        except MessageNotModified:
+            pass
+
+
+# ---------- text input (bot ne kuch maanga tha: channel / footer / block words / API key) ----------
+async def _has_pending(_, __, m):
+    u = getattr(m, "from_user", None)
+    if not u or u.id not in pending:
+        return False
+    if time.time() - pending[u.id]["ts"] > 600:         # 10 min baad bhool jao
+        pending.pop(u.id, None)
+        return False
+    return not (m.text or "").startswith("/")
+
+
+has_pending = filters.create(_has_pending)
+
+
+@app.on_message(filters.private & admin_filter & filters.regex(r"^/\w+"), group=-2)
+async def _drop_pending_on_command(_, m: Message):
+    cmd = (m.text or "").split()[0].lstrip("/").split("@")[0].lower()
+    if cmd != "cancel":
+        pending.pop(m.from_user.id, None)
+
+
+@app.on_message(filters.command("cancel") & filters.private & admin_filter)
+async def cancel_cmd(_, m: Message):
+    if pending.pop(m.from_user.id, None):
+        await m.reply_text("❌ Cancel kar diya.")
+    else:
+        await m.reply_text("Abhi kuch pending nahi hai.")
+
+
+def _norm_domain(w: str) -> str:
+    return re.sub(r"^(?:https?://)?(?:www\.)?", "", w.strip().lower()).split("/")[0]
+
+
+async def handle_text_prompt(m: Message, kind: str):
+    text = (m.text or "").strip()
+    back = InlineKeyboardMarkup([[_btn("⬅️ Settings", "m:main")]])
+    if kind == "footer":
+        state["footer"] = "" if text.lower() == "off" else text[:200]
+        save_state()
+        return await m.reply_text("🗑 Footer hata diya." if not state["footer"] else "✅ Footer set ho gaya.",
+                                  reply_markup=back)
+    if kind in ("blocks", "domains"):
+        key = kind
+        if text.lower() == "list":
+            env_part = BLOCK_WORDS if kind == "blocks" else _EXTRA_DOMAINS
+            return await m.reply_text(f"<b>{PROMPTS[kind][0]}</b>\nEnv: <code>{html.escape(', '.join(env_part) or '—')}</code>\n"
+                                      f"Bot me: <code>{html.escape(', '.join(state[key]) or '—')}</code>",
+                                      parse_mode=ParseMode.HTML, reply_markup=back)
+        added, removed = [], []
+        for raw in [x.strip() for x in text.split(",") if x.strip()]:
+            neg = raw.startswith("-")
+            w = raw[1:] if neg else raw
+            w = _norm_domain(w) if kind == "domains" else w.strip().lstrip("@")
+            if not w:
+                continue
+            if neg and w in state[key]:
+                state[key].remove(w)
+                removed.append(w)
+            elif not neg and w not in state[key]:
+                state[key].append(w)
+                added.append(w)
+        rebuild_block_re()
+        rebuild_link_re()
+        save_state()
+        return await m.reply_text(
+            f"✅ {PROMPTS[kind][0]}\n➕ {', '.join(added) or '—'}\n🗑 {', '.join(removed) or '—'}\n"
+            f"Total: {prompt_status(kind)}", reply_markup=back)
+    if kind in ("tmdb_key", "ocr_key"):
+        if text.lower() == "off":
+            state["texts"].pop(kind, None)
+        elif text:
+            state["texts"][kind] = text
+        apply_runtime()
+        save_state()
+        try:
+            await m.delete()                  # key chat me na rahe
+        except Exception:
+            pass
+        return await m.reply_text(f"✅ {PROMPTS[kind][0]}: {prompt_status(kind)} (tumhara message delete kar diya)",
+                                  reply_markup=back)
+
+
+@app.on_message(filters.private & admin_filter & has_pending, group=-1)
+async def pending_input(client: Client, m: Message):
+    uid = m.from_user.id
+    p = pending.get(uid)
+    if not p:
+        return
+    if p["kind"] == "chan":
+        chat = _fwd_chat(m)
+        ref = chat.id if chat else parse_chat_ref(m.text or "")
+        if ref is None:
+            return await m.reply_text("Samajh nahi aaya. Channel ka message forward karo, ya ID "
+                                      "(<code>-100...</code>) / <code>@username</code> / link bhejo. /cancel se wapas.",
+                                      parse_mode=ParseMode.HTML)
+        if await do_assign(client, m, p["role"], ref):
+            pending.pop(uid, None)
+        return
+    pending.pop(uid, None)
+    await handle_text_prompt(m, p["kind"])
+
+
+# ---------- bot ko kisi channel me admin banaya => admin se poochho ki kaunsa role dena hai ----------
+if hasattr(app, "on_chat_member_updated"):
+    @app.on_chat_member_updated()
+    async def bot_added(client: Client, upd):
+        try:
+            new = upd.new_chat_member
+            if not new or not getattr(new, "user", None) or not new.user.is_self:
+                return
+            if str(getattr(new.status, "name", new.status)).upper() not in ("ADMINISTRATOR", "OWNER"):
+                return
+            old = upd.old_chat_member
+            if old and str(getattr(old.status, "name", old.status)).upper() in ("ADMINISTRATOR", "OWNER"):
+                return                                    # pehle se admin tha, sirf permission badli
+            chat = upd.chat
+            if chat is None or str(getattr(chat.type, "name", chat.type)).upper() not in ("CHANNEL", "SUPERGROUP", "GROUP"):
+                return
+            cid = chat.id
+            if cid in (get_source(), default_target(), get_quality()):
+                return
+            chan_cache[cid] = chat.title or str(cid)
+            kb = InlineKeyboardMarkup([
+                [_btn("📤 Source banao", f"aj:source:{cid}"), _btn("📥 Target banao", f"aj:target:{cid}")],
+                [_btn("🎬 Quality banao", f"aj:quality:{cid}"), _btn("🙅 Ignore", "aj:no:0")],
+            ])
+            for a in list(ADMINS):
+                try:
+                    await client.send_message(
+                        a, f"🆕 Bot ko <b>{html.escape(chat.title or '')}</b> (<code>{cid}</code>) me admin banaya gaya.\n"
+                           "Is channel ko kya banana hai?", parse_mode=ParseMode.HTML, reply_markup=kb)
+                except Exception as e:
+                    print(f"channel-added notify failed for {a}: {type(e).__name__}: {e}")
+        except Exception as e:
+            print(f"chat member update error: {type(e).__name__}: {e}")
+
+
+# ---------- admins ----------
+@app.on_message(filters.command("admins") & filters.private & admin_filter)
+async def admins_cmd(_, m: Message):
+    lines = [f"👑 <code>{a}</code> (owner)" for a in OWNERS] + [f"👤 <code>{a}</code>" for a in ADMINS if a not in OWNERS]
+    await m.reply_text("👥 <b>Admins</b>\n" + "\n".join(lines) +
+                       "\n\nOwner add/remove: <code>/addadmin 123456789</code> · <code>/deladmin 123456789</code>",
+                       parse_mode=ParseMode.HTML)
+
+
+@app.on_message(filters.command(["addadmin", "deladmin"]) & filters.private & owner_filter)
+async def admin_manage_cmd(_, m: Message):
+    arg = m.command[1] if len(m.command) > 1 else ""
+    if not re.fullmatch(r"\d{5,}", arg):
+        return await m.reply_text("Use: <code>/addadmin 123456789</code> (Telegram numeric user ID)", parse_mode=ParseMode.HTML)
+    uid = int(arg)
+    if m.command[0].lower() == "addadmin":
+        if uid not in ADMINS:
+            state["admins"].append(uid)
+        text = f"✅ <code>{uid}</code> ab admin hai."
+    else:
+        if uid in OWNERS:
+            return await m.reply_text("Owner ko hata nahi sakte (wo .env ADMINS me hai).")
+        state["admins"] = [a for a in state["admins"] if a != uid]
+        text = f"🗑 <code>{uid}</code> admin nahi raha."
+    refresh_admins()
+    save_state()
+    await m.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# ---------- backup / restore ----------
+@app.on_message(filters.command("backup") & filters.private & admin_filter)
+async def backup_cmd(_, m: Message):
+    await send_backup(m.chat.id)
+
+
+@app.on_message(filters.command("restore") & filters.private & owner_filter)
+async def restore_cmd(client: Client, m: Message):
+    if running["busy"]:
+        return await m.reply_text("Ek kaam chal raha hai. Pehle /stop karo ya khatam hone do.")
+    rm = m.reply_to_message
+    if not rm or not rm.document:
+        return await m.reply_text("Backup file (<code>cleaner_backup_....json</code>) par <b>reply</b> karke "
+                                  "<code>/restore</code> bhejo.", parse_mode=ParseMode.HTML)
+    if (rm.document.file_size or 0) > 60 * 1024 * 1024:
+        return await m.reply_text("File bahut badi hai, ye backup nahi lagti.")
+    try:
+        bio = await rm.download(in_memory=True)
+        data = json.loads(bio.getvalue().decode("utf-8"))
+        if not isinstance(data, dict) or not ({"cfg", "seen", "source", "target", "totals"} & set(data)):
+            raise ValueError("ye bot ka backup nahi lag raha")
+    except Exception as e:
+        return await m.reply_text(f"❌ Restore nahi hua: <code>{html.escape(type(e).__name__ + ': ' + str(e))}</code>",
+                                  parse_mode=ParseMode.HTML)
+    apply_state_data(data)
+    save_state()
+    await resolve_channels()
+    await m.reply_text(
+        "✅ <b>Restore ho gaya</b>\n"
+        f"📤 Source: {chan_label(get_source()) if get_source() else '—'}\n"
+        f"📥 Target: {chan_label(default_target()) if default_target() else '—'}\n"
+        f"🧠 Yaad rakhi files: <code>{len(seen)}</code>\n"
+        f"🔁 Pending failed: <code>{len(state['failed'])}</code>\n"
+        "Adhura kaam ho to /resume.", parse_mode=ParseMode.HTML)
 
 
 # ---------- block words / footer / maintenance ----------
@@ -2181,12 +3112,32 @@ async def resetseen_cmd(_, m: Message):
 auto_queue = None
 
 
-@app.on_message(filters.chat(SOURCE) & (filters.document | filters.video | filters.audio | filters.photo))
+async def _from_source(_, __, m):
+    s = get_source()                      # dynamic: /settings se source badalte hi naya channel sunna shuru
+    return bool(s and getattr(m, "chat", None) and m.chat.id == s)
+
+
+from_source = filters.create(_from_source)
+
+
+def _auto_type_ok(m: Message) -> bool:
+    if m.video:
+        return cfg["auto_video"]
+    if m.document:
+        return cfg["auto_document"]
+    if m.audio:
+        return cfg["auto_audio"]
+    if m.photo:
+        return cfg["auto_photo"]
+    return True
+
+
+@app.on_message(from_source & (filters.document | filters.video | filters.audio | filters.photo))
 async def auto(client: Client, m: Message):
     if m.id > state.get("src_last", 0):
         state["src_last"] = m.id
         dirty[0] += 1
-    if not cfg["auto"] or auto_queue is None:
+    if not cfg["auto"] or auto_queue is None or not default_target() or not _auto_type_ok(m):
         return
     auto_queue.put_nowait(m)
 
@@ -2196,7 +3147,7 @@ async def process_auto(client: Client, m: Message):
         target, delete_source = destination_for(m, default_target())
         res = await handle(client, prepare(client, m, target), target)
         if res == "sent" and delete_source:
-            await safe(client.delete_messages, SOURCE, m.id)
+            await safe(client.delete_messages, get_source(), m.id)
             print(f"auto msg {m.id}: quality-tagged file sent to {target}; source deleted")
         bump(res)
         maybe_save()
@@ -2206,6 +3157,9 @@ async def process_auto(client: Client, m: Message):
         dirty[0] += 1
         maybe_save(True)
         print(f"auto msg {m.id} failed: {type(e).__name__}: {e}")
+        await notify_admins(f"🚨 <b>Auto-forward fail</b> (msg <code>{m.id}</code>)\n"
+                            f"<code>{html.escape(type(e).__name__ + ': ' + str(e))[:300]}</code>\n"
+                            "Baad me /retryfailed chala sakte ho.", key="auto_fail")
 
 
 async def auto_worker():
@@ -2226,7 +3180,8 @@ async def auto_worker():
 # ======================================================================
 async def health(_):
     js = running.get("job")
-    return web.json_response({"ok": True, "busy": running["busy"], "sent": js.sent if js else 0,
+    return web.json_response({"ok": True, "configured": bool(get_source() and default_target()),
+                              "busy": running["busy"], "sent": js.sent if js else 0,
                               "done": js.done if js else 0, "total": js.total if js else 0,
                               "uptime": int(time.time() - START_TIME)})
 
@@ -2249,7 +3204,10 @@ async def keep_alive():
 async def main():
     global auto_queue
     load_state()
+    refresh_admins()
     rebuild_block_re()
+    rebuild_link_re()
+    apply_runtime()
     auto_queue = asyncio.Queue()
 
     server = web.Application()
@@ -2279,14 +3237,15 @@ async def main():
         except Exception as e:
             print(f"USER_SESSION start nahi hua: {type(e).__name__}: {e}")
             user_app = None
-    await resolve_channels()    # peer cache (Peer id invalid fix)
+    await resolve_channels()    # peer cache (Peer id invalid fix); channel set na ho to bas skip
     ka_task = asyncio.create_task(keep_alive())
     aw_task = asyncio.create_task(auto_worker())
     wd_task = asyncio.create_task(resume_watchdog())
+    bk_task = asyncio.create_task(backup_loop())
 
     # pichla kaam adhura reh gaya tha (restart/redeploy/crash)
     lj = state["last_job"]
-    if lj and not lj.get("done") and lj["last_id"] < lj["end"]:
+    if lj and not lj.get("done") and lj["last_id"] < lj["end"] and get_source() and default_target():
         if AUTO_RESUME and ADMINS and not lj.get("user_stopped"):
             print(f"pichla kaam adhura tha (ID {lj['last_id'] + 1} -> {lj['end']}): auto-resume hoga")
             spawn(auto_resume(5, "startup"), "resume")
@@ -2302,6 +3261,7 @@ async def main():
                     print(f"startup notify failed for {admin}: {e}")
 
     print("Bot started")
+    await setup_nag()
 
     # Har start par admin ko batao: pata chale ki bot restart hua tha aur progress bachi ya nahi
     if STARTUP_NOTIFY:
@@ -2313,9 +3273,9 @@ async def main():
         elif STATE_FOUND:
             extra = "Koi adhura kaam nahi tha."
         else:
-            extra = ("⚠️ <b>Purani progress file nahi mili</b> — Render par disk persist nahi hoti (ya pehli baar start hua). "
-                     "Agar koi kaam chal raha tha to wo <code>/sendall</code> se dobara shuru karo "
-                     "(jo files ja chuki hain wo channel me dikhti hain, par bot ko yaad nahi, isliye duplicate ja sakti hain).")
+            extra = ("⚠️ <b>Purani progress/settings file nahi mili</b> — Render par disk persist nahi hoti (ya pehli baar start hua). "
+                     "Pichla <code>/backup</code> file mere paas ho to uspe reply karke <code>/restore</code> bhejo — "
+                     "channels, settings aur duplicate-memory sab wapas aa jayenge. Warna <code>/settings</code> se dobara set karo.")
         for admin in ADMINS:
             try:
                 await app.send_message(admin, f"🟢 <b>Bot start/restart hua</b>\n{extra}", parse_mode=ParseMode.HTML)
@@ -2344,6 +3304,7 @@ async def main():
     ka_task.cancel()
     aw_task.cancel()
     wd_task.cancel()
+    bk_task.cancel()
     save_state()
     if user_app is not None:
         try:
